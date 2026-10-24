@@ -5,7 +5,7 @@ import { z } from "zod";
 import { getConfig } from "./config.js";
 import { closeDatabase, getDatabase, initDatabase } from "./db.js";
 import { buildMemoryText, enqueueMemory, newMemoryId, recallForAgent, resumePendingMemories } from "./memory-queue.js";
-import { formatMist, getPayrollBalance, suiToMist, transferSui, verifyTransaction } from "./payroll-chain.js";
+import { formatMist, getPayrollBalance, getPayrollBalanceBreakdown, suiToMist, transferSui, verifyTransaction } from "./payroll-chain.js";
 import { createWallet, getWallet } from "./wallets.js";
 import { getTatumActivity } from "./tatum.js";
 
@@ -50,7 +50,11 @@ const walletPolicySchema = z.object({
   period_cap_sui: z.number().positive(),
   allowed_vendor_ids: z.array(z.string().min(1)),
 });
-const payrollSchema = z.object({ agent_id: z.string().optional(), period_label: z.string().trim().min(1).max(100) });
+const payrollSchema = z.object({
+  agent_id: z.string().optional(),
+  agent_ids: z.array(z.string().min(1)).min(1).optional(),
+  period_label: z.string().trim().min(1).max(100),
+});
 const spendSchema = z.object({
   vendor_id: z.string().min(1),
   amount_sui: z.number().positive(),
@@ -159,7 +163,7 @@ function periodStart(agentId) {
 }
 
 function spentSince(agentId, start) {
-  const rows = getDatabase().prepare("SELECT amount_mist FROM transactions WHERE agent_id=? AND kind='spend' AND status='executed' AND created_at>=?").all(agentId, start);
+  const rows = getDatabase().prepare("SELECT amount_mist FROM transactions WHERE agent_id=? AND kind='spend' AND status IN ('executed','unconfirmed') AND created_at>=?").all(agentId, start);
   return rows.reduce((total, row) => total + BigInt(row.amount_mist), 0n);
 }
 
@@ -346,8 +350,17 @@ export async function buildServer() {
     if (!admin && agent.id !== request.params.id) return reply.code(403).send({ error: "forbidden" });
     const wallet = getWallet("agent", request.params.id);
     if (!wallet) return reply.code(404).send({ error: "agent wallet not found" });
-    const balance = await getPayrollBalance(wallet.address);
-    return { address: wallet.address, balance_mist: balance.toString(), balance_sui: formatMist(balance), transport: "tatum-grpc" };
+    const balance = await getPayrollBalanceBreakdown(wallet.address, { bypassCache: true });
+    return {
+      address: wallet.address,
+      balance_mist: balance.totalBalance.toString(),
+      balance_sui: formatMist(balance.totalBalance),
+      coin_balance_mist: balance.coinBalance.toString(),
+      coin_balance_sui: formatMist(balance.coinBalance),
+      address_balance_mist: balance.addressBalance.toString(),
+      address_balance_sui: formatMist(balance.addressBalance),
+      transport: "tatum-grpc",
+    };
   });
 
   app.post("/v1/payroll/run", async (request, reply) => {
@@ -355,9 +368,18 @@ export async function buildServer() {
     const parsed = payrollSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
     const db = getDatabase();
-    if (parsed.data.agent_id && !db.prepare("SELECT 1 FROM agents WHERE id=?").get(parsed.data.agent_id)) return reply.code(404).send({ error: "agent not found" });
-    const agents = parsed.data.agent_id
-      ? db.prepare("SELECT id,name FROM agents WHERE id=? AND status='active'").all(parsed.data.agent_id)
+    const requestedIds = [...new Set([...(parsed.data.agent_id ? [parsed.data.agent_id] : []), ...(parsed.data.agent_ids ?? [])])];
+    if (requestedIds.length) {
+      const placeholders = requestedIds.map(() => "?").join(",");
+      const foundIds = new Set(db.prepare(`SELECT id FROM agents WHERE id IN (${placeholders})`).all(...requestedIds).map((row) => row.id));
+      const missingId = requestedIds.find((id) => !foundIds.has(id));
+      if (missingId) return reply.code(404).send({ error: "agent not found", agent_id: missingId });
+    }
+    const agents = requestedIds.length
+      ? (() => {
+        const placeholders = requestedIds.map(() => "?").join(",");
+        return db.prepare(`SELECT id,name FROM agents WHERE id IN (${placeholders}) AND status='active' ORDER BY created_at`).all(...requestedIds);
+      })()
       : db.prepare("SELECT id,name FROM agents WHERE status='active' ORDER BY created_at").all();
     const eligible = agents.map((agent) => ({
       agent,
@@ -369,7 +391,9 @@ export async function buildServer() {
     if (!treasury) return reply.code(409).send({ error: "treasury wallet has not been created" });
     if (!eligible.length) return { period_label: parsed.data.period_label, paid: [], skipped: agents.length };
 
-    const required = eligible.reduce((sum, item) => sum + BigInt(item.policy.salary_mist), 0n) + BigInt(eligible.length) * 50_000_000n;
+    const salariesRequired = eligible.reduce((sum, item) => sum + BigInt(item.policy.salary_mist), 0n);
+    const estimatedGas = BigInt(eligible.length) * 50_000_000n;
+    const required = salariesRequired + estimatedGas;
     const treasuryBalance = await getPayrollBalance(treasury.address);
     if (treasuryBalance < required) {
       return reply.code(402).send({
@@ -377,6 +401,10 @@ export async function buildServer() {
         treasury_address: treasury.address,
         balance_sui: formatMist(treasuryBalance),
         required_sui: formatMist(required),
+        agent_ids: eligible.map(({ agent }) => agent.id),
+        total_required_sui: formatMist(required),
+        estimated_gas_sui: formatMist(estimatedGas),
+        treasury_balance_sui: formatMist(treasuryBalance),
       });
     }
 
@@ -385,15 +413,18 @@ export async function buildServer() {
       const amount = BigInt(item.policy.salary_mist);
       const txId = `pay_${randomUUID()}`;
       try {
-        const confirmation = await transferSui(treasury, item.wallet.address, amount);
+        const confirmation = await transferSui(treasury, item.wallet.address, amount, {
+          onExecuted: (execution) => db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,checkpoint,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), execution.error ?? "execution_submitted", execution.status, execution.digest, execution.confirmedAt, execution.checkpoint, new Date().toISOString()),
+        });
         const createdAt = new Date().toISOString();
         const start = periodStart(item.agent.id);
         const spent = spentSince(item.agent.id, start);
         const saved = amount - spent;
         const payslipId = `slip_${randomUUID()}`;
         const transaction = db.transaction(() => {
-          db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), "salary_paid", "executed", confirmation.digest, createdAt, createdAt);
+          db.prepare(`UPDATE transactions SET rule_result=?,status=?,digest=?,confirmed_at=?,checkpoint=? WHERE id=?`)
+            .run(confirmation.error ?? "salary_paid", confirmation.status === "success" ? "executed" : confirmation.status, confirmation.digest, confirmation.confirmedAt, confirmation.checkpoint, txId);
           db.prepare(`INSERT INTO payslips(id,agent_id,period_label,salary_mist,spent_mist,saved_mist,salary_digest,created_at)
             VALUES(?,?,?,?,?,?,?,?)`).run(payslipId, item.agent.id, parsed.data.period_label, amount.toString(), spent.toString(), saved.toString(), confirmation.digest, createdAt);
         });
@@ -401,7 +432,10 @@ export async function buildServer() {
         paid.push({ agent_id: item.agent.id, salary_sui: formatMist(amount), digest: confirmation.digest, status: confirmation.status, payslip_id: payslipId });
       } catch (error) {
           const failure = reportTransferFailure(error);
-        db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,created_at)
+        const existing = db.prepare("SELECT id FROM transactions WHERE id=?").get(txId);
+        if (existing) db.prepare("UPDATE transactions SET rule_result=?,status='failed',digest=COALESCE(?,digest),confirmed_at=?,checkpoint=? WHERE id=?")
+          .run(`${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, error.checkpoint ?? null, txId);
+        else db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,created_at)
             VALUES(?,?,?,?,?,?, 'failed',?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), `${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, new Date().toISOString());
           return reply.code(502).send({ error: "payroll transfer failed", stage: failure.stage, message: failure.message, paid, failed_agent_id: item.agent.id });
       }
@@ -456,10 +490,13 @@ export async function buildServer() {
       }
 
       try {
-        const confirmation = await transferSui(wallet, vendor.address, amount);
+        const confirmation = await transferSui(wallet, vendor.address, amount, {
+          onExecuted: (execution) => db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,checkpoint,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(txId, agent.id, "spend", vendor.address, amount.toString(), parsed.data.reason, parsed.data.category, vendor.id, execution.error ?? "execution_submitted", execution.status, execution.digest, execution.confirmedAt, execution.checkpoint, createdAt),
+        });
         const confirmedAt = new Date().toISOString();
-        db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,'executed',?,?,?)`).run(txId, agent.id, "spend", vendor.address, amount.toString(), parsed.data.reason, parsed.data.category, vendor.id, "allowed", confirmation.digest, confirmedAt, createdAt);
+        db.prepare(`UPDATE transactions SET rule_result='allowed',status=?,digest=?,confirmed_at=?,checkpoint=? WHERE id=?`)
+          .run(confirmation.status === "success" ? "executed" : confirmation.status, confirmation.digest, confirmation.confirmedAt ?? null, confirmation.checkpoint ?? null, txId);
 
         const payslip = db.prepare("SELECT * FROM payslips WHERE agent_id=? ORDER BY created_at DESC LIMIT 1").get(agent.id);
         if (payslip) {
@@ -475,10 +512,13 @@ export async function buildServer() {
           details: { vendor_id: vendor.id, vendor_label: vendor.label, amount_mist: amount.toString(), amount_sui: formatMist(amount), reason: parsed.data.reason, digest: confirmation.digest },
           ts: confirmedAt,
         });
-        return reply.code(201).send({ transaction_id: txId, status: "executed", digest: confirmation.digest, amount_mist: amount.toString(), amount_sui: formatMist(amount), vendor_id: vendor.id });
+        return reply.code(201).send({ transaction_id: txId, status: confirmation.status, digest: confirmation.digest, amount_mist: amount.toString(), amount_sui: formatMist(amount), vendor_id: vendor.id });
       } catch (error) {
           const failure = reportTransferFailure(error);
-        db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,created_at)
+        const existing = db.prepare("SELECT id FROM transactions WHERE id=?").get(txId);
+        if (existing) db.prepare("UPDATE transactions SET rule_result=?,status='failed',digest=COALESCE(?,digest),confirmed_at=?,checkpoint=? WHERE id=?")
+          .run(`${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, error.checkpoint ?? null, txId);
+        else db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,created_at)
             VALUES(?,?,?,?,?,?,?,?,?,'failed',?,?,?)`).run(txId, agent.id, "spend", vendor.address, amount.toString(), parsed.data.reason, parsed.data.category, vendor.id, `${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, new Date().toISOString());
           return reply.code(502).send({ error: "Sui transfer failed", stage: failure.stage, message: failure.message, transaction_id: txId });
       }
@@ -518,6 +558,8 @@ export async function buildServer() {
     if (!record) return reply.code(404).send({ error: "transaction not found" });
     if (!admin && record.agent_id !== agent.id) return reply.code(403).send({ error: "forbidden" });
     const verified = await verifyTransaction(request.params.digest);
+    getDatabase().prepare("UPDATE transactions SET status=?,confirmed_at=?,checkpoint=?,rule_result=? WHERE digest=?")
+      .run(verified.status === "success" ? "executed" : verified.status, verified.confirmedAt, verified.checkpoint, verified.error ?? "verified", request.params.digest);
     return { ...verified, kind: record.kind, amount_mist: record.amount_mist, amount_sui: formatMist(record.amount_mist) };
   });
 

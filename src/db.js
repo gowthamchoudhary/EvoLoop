@@ -85,9 +85,10 @@ export function initDatabase() {
       category TEXT,
       vendor_id TEXT REFERENCES vendors(id),
       rule_result TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('executed','blocked','failed')),
+      status TEXT NOT NULL CHECK(status IN ('executed','unconfirmed','blocked','failed')),
       digest TEXT UNIQUE,
       confirmed_at TEXT,
+      checkpoint TEXT,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS transactions_agent_created ON transactions(agent_id, created_at DESC);
@@ -104,6 +105,34 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS payslips_agent_created ON payslips(agent_id, created_at DESC);
   `);
+  const transactionSchema = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get()?.sql ?? "";
+  if (!transactionSchema.includes("'unconfirmed'") || !/checkpoint\s+TEXT/i.test(transactionSchema)) {
+    database.exec(`
+      ALTER TABLE transactions RENAME TO transactions_before_confirmation_migration;
+      CREATE TABLE transactions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        kind TEXT NOT NULL CHECK(kind IN ('salary','spend')),
+        to_address TEXT NOT NULL,
+        amount_mist TEXT NOT NULL,
+        reason TEXT,
+        category TEXT,
+        vendor_id TEXT REFERENCES vendors(id),
+        rule_result TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('executed','unconfirmed','blocked','failed')),
+        digest TEXT UNIQUE,
+        confirmed_at TEXT,
+        checkpoint TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,checkpoint,created_at)
+        SELECT id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,NULL,created_at
+        FROM transactions_before_confirmation_migration;
+      DROP TABLE transactions_before_confirmation_migration;
+      CREATE INDEX IF NOT EXISTS transactions_agent_created ON transactions(agent_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS transactions_kind_status ON transactions(kind, status);
+    `);
+  }
   return database;
 }
 
