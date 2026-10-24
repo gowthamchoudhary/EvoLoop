@@ -1,4 +1,5 @@
 import { getConfig } from "../src/config.js";
+import { tatumHttpRequest } from "../src/tatum.js";
 
 const config = getConfig();
 const rootEndpoint = "https://sui-mainnet.gateway.tatum.io";
@@ -15,12 +16,13 @@ for (const endpoint of endpoints) {
   console.log(`Endpoint ${url.origin}${url.pathname}: host=${url.host}, path=${url.pathname}`);
   let works = false;
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "x-api-key": config.TATUM_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "suix_getBalance", params: [config.SUI_TEST_ADDRESS] }),
+    const response = await tatumHttpRequest({
+      url: endpoint,
+      apiKey: config.TATUM_API_KEY,
+      method: "suix_getBalance",
+      params: [config.SUI_TEST_ADDRESS],
     });
-    const fullBody = await response.text();
+    const fullBody = response.body;
     const body = redact(fullBody).slice(0, 300);
     console.log(`HTTP status: ${response.status}`);
     console.log(`Response body (up to 300 characters): ${body}`);
