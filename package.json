@@ -1,0 +1,16 @@
+﻿{
+  "name": "payroll-layer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "@mysten-incubation/memwal": "^0.1.7",
+    "dotenv": "^16.4.7"
+  }
+}
