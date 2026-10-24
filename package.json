@@ -7,13 +7,22 @@
     "node": ">=20"
   },
   "scripts": {
-    "smoke": "node scripts/smoke.js"
+    "smoke": "node scripts/smoke.js",
+    "dev": "node src/server.js",
+    "smoke:block1": "node scripts/smoke-block1.js",
+    "treasury:create": "node scripts/treasury-create.js",
+    "vendors:seed": "node scripts/vendors-seed.js",
+    "smoke:block2": "node scripts/smoke-block2.js",
+    "debug:transfer": "node scripts/debug-transfer.js"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.14.6",
     "@mysten-incubation/memwal": "^0.1.7",
     "@mysten/sui": "^2.37.0",
     "@protobuf-ts/grpc-transport": "^2.11.1",
-    "dotenv": "^16.4.7"
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.12.7",
+    "zod": "^4.6.7"
   }
 }
