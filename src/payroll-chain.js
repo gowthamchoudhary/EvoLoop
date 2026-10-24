@@ -1,15 +1,16 @@
 import { coinWithBalance, Transaction } from "@mysten/sui/transactions";
-import { decryptWallet, getWallet } from "./wallets.js";
+import { decryptWallet } from "./wallets.js";
 import { closeTatum, getTatumClient } from "./tatum.js";
 
 const MIN_GAS_BUDGET_MIST = 3_000_000n;
 const SIMULATION_GAS_BUDGET_MIST = 10_000_000n;
 const GAS_PRICE_TTL_MS = 30_000;
-const TREASURY_BALANCE_TTL_MS = 5_000;
+const BALANCE_TTL_MS = 5_000;
 let gasPriceCache;
 let gasPriceInFlight;
-let treasuryBalanceCache;
-let treasuryBalanceInFlight;
+const balanceCache = new Map();
+const balanceInFlight = new Map();
+const balanceGeneration = new Map();
 
 async function getReferenceGasPrice() {
   if (gasPriceCache && Date.now() < gasPriceCache.expiresAt) return gasPriceCache.value;
@@ -24,57 +25,89 @@ async function getReferenceGasPrice() {
   return gasPriceInFlight;
 }
 
-export async function getPayrollBalance(address) {
-  const { totalBalance } = await getPayrollBalanceBreakdown(address);
+export async function getPayrollBalance(address, options) {
+  const { totalBalance } = await getPayrollBalanceBreakdown(address, options);
   return totalBalance;
 }
 
-export async function getPayrollBalanceBreakdown(address) {
-  const treasury = getWallet("treasury", "treasury");
-  if (treasury?.address === address && treasuryBalanceCache && Date.now() < treasuryBalanceCache.expiresAt) {
-    return { ...treasuryBalanceCache.value };
+export async function getPayrollBalanceBreakdown(address, { bypassCache = false } = {}) {
+  const cached = balanceCache.get(address);
+  if (!bypassCache && cached && Date.now() < cached.expiresAt) return { ...cached.value };
+  if (!bypassCache && balanceInFlight.has(address)) return { ...(await balanceInFlight.get(address)) };
+
+  const generation = balanceGeneration.get(address) ?? 0;
+  const request = getTatumClient().getBalance({ owner: address, coinType: "0x2::sui::SUI" })
+    .then((response) => {
+      const balance = response.balance;
+      const value = {
+        totalBalance: BigInt(balance.balance),
+        coinBalance: BigInt(balance.coinBalance ?? "0"),
+        addressBalance: BigInt(balance.addressBalance ?? "0"),
+      };
+      if ((balanceGeneration.get(address) ?? 0) === generation) {
+        balanceCache.set(address, { value, expiresAt: Date.now() + BALANCE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      if (balanceInFlight.get(address) === request) balanceInFlight.delete(address);
+    });
+  if (!bypassCache) balanceInFlight.set(address, request);
+  return { ...(await request) };
+}
+
+function invalidateBalanceCache(...addresses) {
+  for (const address of addresses) {
+    balanceGeneration.set(address, (balanceGeneration.get(address) ?? 0) + 1);
+    balanceCache.delete(address);
+    balanceInFlight.delete(address);
   }
-  if (treasury?.address === address && treasuryBalanceInFlight) return { ...(await treasuryBalanceInFlight) };
-  const readBalance = async () => {
-    const response = await getTatumClient().getBalance({ owner: address, coinType: "0x2::sui::SUI" });
-    const balance = response.balance;
-    return {
-      totalBalance: BigInt(balance.balance),
-      coinBalance: BigInt(balance.coinBalance ?? "0"),
-      addressBalance: BigInt(balance.addressBalance ?? "0"),
-    };
-  };
-  if (treasury?.address === address) {
-    treasuryBalanceInFlight = readBalance()
-      .then((value) => {
-        treasuryBalanceCache = { value, expiresAt: Date.now() + TREASURY_BALANCE_TTL_MS };
-        return value;
-      })
-      .finally(() => { treasuryBalanceInFlight = undefined; });
-    return { ...(await treasuryBalanceInFlight) };
-  }
-  return readBalance();
 }
 
 export async function getTransactionByDigest(digest) {
   return getTatumClient().getTransaction({ digest, include: { effects: true, transaction: true } });
 }
 
-export async function verifyTransaction(digest) {
-  const result = await getTransactionByDigest(digest);
+function isNotFound(error) {
+  return String(error?.code ?? error?.status ?? "").toUpperCase() === "NOT_FOUND"
+    || /not[_ ]found|does not exist/i.test(String(error?.message ?? ""));
+}
+
+function transactionFromResult(result) {
   const transaction = result.Transaction ?? result.FailedTransaction;
-  if (!transaction) throw new Error(`Tatum returned no transaction for digest ${digest}`);
-  const success = result.$kind === "Transaction" && transaction.status?.success === true;
+  if (!transaction) return null;
+  const status = transaction.status ?? transaction.effects?.status ?? result.status;
+  const success = result.$kind === "Transaction" && status?.success === true;
+  const checkpoint = transaction.checkpoint ?? result.checkpoint ?? null;
   return {
-    digest: transaction.digest,
+    digest: transaction.digest ?? result.digest,
     status: success ? "success" : "failed",
-    error: success ? null : transaction.status?.error?.message ?? "Sui transaction execution failed",
+    error: success ? null : status?.error?.message ?? status?.error ?? "Sui transaction execution failed",
     sender: transaction.transaction?.sender ?? null,
-    timestamp: transaction.timestampMs === null ? null : new Date(transaction.timestampMs).toISOString(),
+    timestamp: transaction.timestampMs == null ? null : new Date(Number(transaction.timestampMs)).toISOString(),
+    checkpoint: checkpoint == null ? null : String(checkpoint),
   };
 }
 
-export async function transferSui(wallet, toAddress, amountMist, { onStage } = {}) {
+export async function verifyTransaction(digest, { onPoll } = {}) {
+  const deadline = Date.now() + 40_000;
+  while (true) {
+    try {
+      const verified = transactionFromResult(await getTransactionByDigest(digest));
+      if (!verified) throw new Error(`Tatum returned no transaction for digest ${digest}`);
+      return { ...verified, confirmedAt: new Date().toISOString() };
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      onPoll?.({ digest, status: "pending" });
+      if (Date.now() >= deadline) {
+        return { digest, status: "unconfirmed", error: null, sender: null, timestamp: null, checkpoint: null, confirmedAt: null };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, deadline - Date.now())));
+    }
+  }
+}
+
+export async function transferSui(wallet, toAddress, amountMist, { onStage, onExecuted } = {}) {
   const amount = BigInt(amountMist);
   if (amount <= 0n) throw new Error("Transfer amount must be positive");
   const runStage = async (name, action) => {
@@ -91,15 +124,37 @@ export async function transferSui(wallet, toAddress, amountMist, { onStage } = {
   };
   const keypair = await runStage("load_wallet", async () => decryptWallet(wallet));
   const sender = keypair.toSuiAddress();
+  const balance = await runStage("select_funding", () => getPayrollBalanceBreakdown(sender, { bypassCache: true }));
+  const requiredWithGas = amount + SIMULATION_GAS_BUDGET_MIST;
+  let fundingSource;
+  if (balance.addressBalance >= requiredWithGas) fundingSource = "address_balance";
+  else if (balance.coinBalance >= requiredWithGas) fundingSource = "coin_objects";
+  else {
+    const error = new Error(`Insufficient SUI funds: amount=${amount} MIST, gas_budget=${SIMULATION_GAS_BUDGET_MIST} MIST, required=${requiredWithGas} MIST, total=${balance.totalBalance} MIST, coin_objects=${balance.coinBalance} MIST, address_balance=${balance.addressBalance} MIST`);
+    error.stage = "select_funding";
+    throw error;
+  }
   const gasPrice = await runStage("get_gas_price", getReferenceGasPrice);
   const parsedGasPrice = BigInt(gasPrice.referenceGasPrice);
   const transaction = new Transaction();
   transaction.setSender(sender);
   transaction.setGasPrice(parsedGasPrice);
   transaction.setGasBudget(SIMULATION_GAS_BUDGET_MIST);
-  transaction.setGasPayment([]);
-  const [coin] = transaction.add(coinWithBalance({ balance: amount, type: "0x2::sui::SUI", useGasCoin: false }));
-  transaction.transferObjects([coin], toAddress);
+  if (fundingSource === "address_balance") {
+    transaction.setGasPayment([]);
+    transaction.moveCall({
+      target: "0x2::balance::send_funds",
+      typeArguments: ["0x2::sui::SUI"],
+      arguments: [transaction.balance({ balance: amount, useGasCoin: false }), transaction.pure.address(toAddress)],
+    });
+  } else {
+    const [coin] = transaction.add(coinWithBalance({ balance: amount, type: "0x2::sui::SUI", useGasCoin: false }));
+    transaction.moveCall({
+      target: "0x2::coin::send_funds",
+      typeArguments: ["0x2::sui::SUI"],
+      arguments: [coin, transaction.pure.address(toAddress)],
+    });
+  }
   let tx = await runStage("build_tx", async () => {
     try {
       return await transaction.build({ client: getTatumClient() });
@@ -158,14 +213,37 @@ export async function transferSui(wallet, toAddress, amountMist, { onStage } = {
     error.stage = "execute";
     throw error;
   }
+  const executionStatus = executed.status ?? executed.effects?.status;
+  const executionSucceeded = submitted.$kind === "Transaction" && executionStatus?.success === true;
+  const executionFailed = submitted.$kind === "FailedTransaction" || executionStatus?.success === false;
+  const executionError = executionStatus?.error?.message ?? executionStatus?.error ?? "Sui transaction execution failed";
+  await onExecuted?.({
+    digest: executed.digest,
+    status: executionFailed ? "failed" : "executed",
+    error: executionFailed ? String(executionError) : null,
+    checkpoint: executed.checkpoint ?? submitted.checkpoint ?? null,
+    confirmedAt: null,
+  });
+  if (executionFailed) {
+    const error = new Error(String(executionError));
+    error.digest = executed.digest;
+    error.stage = "execute";
+    throw error;
+  }
+  invalidateBalanceCache(sender, toAddress);
   const confirmation = await runStage("confirm", async () => verifyTransaction(executed.digest));
   if (confirmation.status !== "success") {
+    if (confirmation.status === "unconfirmed") {
+      return { ...confirmation, status: "unconfirmed" };
+    }
     const error = new Error(confirmation.error ?? "Sui transaction execution failed");
     error.digest = confirmation.digest;
     error.confirmedAt = confirmation.timestamp;
+    error.checkpoint = confirmation.checkpoint;
     error.stage = "confirm";
     throw error;
   }
+  invalidateBalanceCache(sender, toAddress);
   return confirmation;
 }
 
