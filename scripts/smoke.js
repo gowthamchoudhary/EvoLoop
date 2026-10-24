@@ -1,6 +1,7 @@
 ﻿import { getConfig } from "../src/config.js";
 import { health, recall, remember } from "../src/walrus.js";
-import { getSuiBalance } from "../src/sui.js";
+import { getSuiBalance } from "../src/sui-grpc.js";
+import { getSuiBalance as getSuiBalanceJsonRpc } from "../src/sui.js";
 
 const secrets = [process.env.MEMWAL_KEY, process.env.TATUM_API_KEY].filter(Boolean);
 function safeMessage(error) {
@@ -42,8 +43,18 @@ await step("Walrus write and recall", async () => {
 });
 
 await step("Tatum Sui balance", async () => {
-  const balance = await getSuiBalance(getConfig().SUI_TEST_ADDRESS);
-  return `${balance} SUI`;
+  const address = getConfig().SUI_TEST_ADDRESS;
+  try {
+    const balance = await getSuiBalance(address);
+    return `gRPC: ${balance} SUI`;
+  } catch (grpcError) {
+    try {
+      const balance = await getSuiBalanceJsonRpc(address);
+      return `JSON-RPC fallback: ${balance} SUI (gRPC failed: ${safeMessage(grpcError)})`;
+    } catch (jsonRpcError) {
+      throw new Error(`gRPC failed: ${safeMessage(grpcError)}; JSON-RPC fallback failed: ${safeMessage(jsonRpcError)}`);
+    }
+  }
 });
 
 console.log(`Summary: ${passed} passed, ${failed} failed`);
