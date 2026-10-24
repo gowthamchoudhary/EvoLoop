@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "payroll-layer",
   "version": "1.0.0",
   "private": true,
@@ -10,7 +10,10 @@
     "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.6",
     "@mysten-incubation/memwal": "^0.1.7",
+    "@mysten/sui": "^2.37.0",
+    "@protobuf-ts/grpc-transport": "^2.11.1",
     "dotenv": "^16.4.7"
   }
 }
