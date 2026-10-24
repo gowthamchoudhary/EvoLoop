@@ -3,13 +3,13 @@ import { getConfig } from "./config.js";
 
 let memory;
 
-export function createMemory() {
+export function createMemory(namespace = undefined) {
   const config = getConfig();
   return MemWal.create({
     key: config.MEMWAL_KEY,
     accountId: config.MEMWAL_ACCOUNT_ID,
     serverUrl: config.MEMWAL_SERVER_URL,
-    namespace: config.MEMWAL_NAMESPACE,
+    namespace: namespace ?? config.MEMWAL_NAMESPACE,
   });
 }
 
