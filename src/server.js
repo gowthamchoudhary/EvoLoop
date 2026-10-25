@@ -5,9 +5,14 @@ import { z } from "zod";
 import { getConfig } from "./config.js";
 import { closeDatabase, getDatabase, initDatabase } from "./db.js";
 import { buildMemoryText, enqueueMemory, newMemoryId, recallForAgent, resumePendingMemories } from "./memory-queue.js";
-import { formatMist, getPayrollBalance, getPayrollBalanceBreakdown, suiToMist, transferSui, verifyTransaction } from "./payroll-chain.js";
+import { closePayrollChain, formatMist, getPayrollBalance, getPayrollBalanceBreakdown, suiToMist, transferSui, verifyTransaction } from "./payroll-chain.js";
 import { createWallet, getWallet } from "./wallets.js";
 import { getTatumActivity } from "./tatum.js";
+import { publicGap, publicReview, runReview } from "./review.js";
+import { reportTransferFailure, safeText } from "./events.js";
+import { periodStart, spendForAgent, spentSince } from "./spend.js";
+import { settingsFor } from "./settings.js";
+import { approveRequest, createProposalsForReview, getRequest, guidanceForAgent, listCatalog, listRequests, rejectRequest } from "./upgrades.js";
 
 export const eventTypes = z.enum([
   "task_completed",
@@ -26,6 +31,7 @@ const eventSchema = z.object({
   score: z.number().min(0).max(1).optional(),
   cost_usd: z.number().min(0).optional(),
   correction: z.string().max(500).optional(),
+  session_id: z.string().trim().min(1).max(64).optional(),
   ts: z.string().datetime({ offset: true }).optional().default(() => new Date().toISOString()),
 });
 
@@ -50,6 +56,32 @@ const walletPolicySchema = z.object({
   period_cap_sui: z.number().positive(),
   allowed_vendor_ids: z.array(z.string().min(1)),
 });
+const settingsSchema = z.object({
+  period: z.enum(["daily", "weekly", "monthly", "compressed"]).default("monthly"),
+  period_minutes: z.number().int().positive().nullable().default(null),
+  allowance_mist: z.string().trim().regex(/^\d{1,40}$/).default("0"),
+  improvement_reserve_pct: z.number().int().min(0).max(100).default(40),
+  autonomy: z.enum(["ask", "auto_small", "never"]).default("ask"),
+  auto_limit_mist: z.string().trim().regex(/^\d{1,40}$/).default("0"),
+  rollover: z.union([z.boolean(), z.number().int().min(0).max(1)]).default(false),
+});
+const approveSchema = z.object({
+  note: z.string().trim().max(500).optional(),
+  extra_budget_sui: z.number().positive().optional(),
+});
+const rejectSchema = z.object({ note: z.string().trim().max(500).optional() });
+const requestQuerySchema = z.object({
+  agent_id: z.string().min(1).optional(),
+  status: z.enum(["needs_raise", "pending_approval", "auto_approved", "approved", "rejected", "executed", "failed", "note_only"]).optional(),
+});
+const reviewRunSchema = z.object({
+  period_label: z.string().trim().min(1).max(100).optional(),
+  window_start: z.string().datetime({ offset: true }).optional(),
+  window_end: z.string().datetime({ offset: true }).optional(),
+}).refine((value) => !value.window_start || !value.window_end || Date.parse(value.window_start) <= Date.parse(value.window_end), {
+  message: "window_start must not be after window_end",
+  path: ["window_start"],
+});
 const payrollSchema = z.object({
   agent_id: z.string().optional(),
   agent_ids: z.array(z.string().min(1)).min(1).optional(),
@@ -67,22 +99,6 @@ const equalHash = (left, right) => {
   const b = Buffer.from(right, "hex");
   return a.length === b.length && timingSafeEqual(a, b);
 };
-const agentSpendLocks = new Map();
-
-async function withAgentSpendLock(agentId, callback) {
-  const previous = agentSpendLocks.get(agentId) ?? Promise.resolve();
-  let release;
-  const current = new Promise((resolve) => { release = resolve; });
-  agentSpendLocks.set(agentId, current);
-  await previous;
-  try {
-    return await callback();
-  } finally {
-    release();
-    if (agentSpendLocks.get(agentId) === current) agentSpendLocks.delete(agentId);
-  }
-}
-
 function bearerToken(request) {
   const match = /^Bearer\s+(.+)$/i.exec(request.headers.authorization ?? "");
   return match?.[1] ?? null;
@@ -103,68 +119,8 @@ function authError(reply) {
   return reply.code(401).send({ error: "unauthorized" });
 }
 
-function safeText(value) {
-  let text = String(value);
-  try {
-    const config = getConfig();
-    for (const secret of [config.MEMWAL_KEY, config.TATUM_API_KEY, config.ADMIN_TOKEN, config.WALLET_ENC_KEY]) text = text.split(secret).join("[REDACTED]");
-  } catch {}
-  return text
-    .replace(/\b(?:plk_[a-f0-9]{64}|suiprivkey1[0-9a-z]+|(?:0x)?[a-f0-9]{64})\b/gi, "[REDACTED]");
-}
-
-function reportTransferFailure(error) {
-  const details = {
-    stage: error.stage ?? "unknown",
-    errorClass: error?.originalErrorClass ?? error?.constructor?.name ?? "Error",
-    message: safeText(error?.message ?? error),
-  };
-  if (error?.code !== undefined) details.grpcStatusCode = safeText(error.code);
-  if (error?.details !== undefined) details.grpcDetails = safeText(error.details);
-  console.error("Sui transfer failed", JSON.stringify(details));
-  return details;
-}
-
 function parseEventRows(rows) {
   return rows.map(({ details_json, ...row }) => ({ ...row, details: details_json ? JSON.parse(details_json) : null }));
-}
-
-function insertEvent(agentId, event) {
-  const agent = getDatabase().prepare("SELECT name FROM agents WHERE id=?").get(agentId);
-  const eventId = `evt_${randomUUID()}`;
-  const memoryId = newMemoryId();
-  const text = buildMemoryText({ agentName: agent.name, event, eventId });
-  const now = new Date().toISOString();
-  const db = getDatabase();
-  const insert = db.transaction(() => {
-    db.prepare(`INSERT INTO events(id,agent_id,type,task_category,summary,details_json,score,cost_usd,correction,ts,memory_status)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
-      eventId, agentId, event.type, event.task_category, event.summary,
-      event.details === undefined ? null : JSON.stringify(event.details), event.score ?? null,
-      event.cost_usd ?? null, event.correction ?? null, event.ts ?? now, "pending",
-    );
-    db.prepare("INSERT INTO memories(id,event_id,agent_id,text,status,created_at) VALUES(?,?,?,?,?,?)")
-      .run(memoryId, eventId, agentId, text, "pending", now);
-  });
-  insert();
-  enqueueMemory(memoryId);
-  return eventId;
-}
-
-function isMissingCapability(reason) {
-  return /\b(?:missing|lack(?:ing)?|without)\s+(?:the\s+)?capabilit(?:y|ies)\b|\bcapabilit(?:y|ies)\s+(?:is\s+)?missing\b/i.test(reason);
-}
-
-function periodStart(agentId) {
-  const payslip = getDatabase().prepare("SELECT created_at FROM payslips WHERE agent_id=? ORDER BY created_at DESC LIMIT 1").get(agentId);
-  if (payslip) return payslip.created_at;
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-}
-
-function spentSince(agentId, start) {
-  const rows = getDatabase().prepare("SELECT amount_mist FROM transactions WHERE agent_id=? AND kind='spend' AND status IN ('executed','unconfirmed') AND created_at>=?").all(agentId, start);
-  return rows.reduce((total, row) => total + BigInt(row.amount_mist), 0n);
 }
 
 function publicTransaction(row) {
@@ -183,6 +139,7 @@ export async function buildServer() {
 
   app.setErrorHandler((error, request, reply) => {
     const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
+    if (status === 500) console.error(safeText(error.stack ?? error.message));
     reply.code(status).send({ error: status === 500 ? "internal server error" : safeText(error.message) });
   });
 
@@ -225,24 +182,25 @@ export async function buildServer() {
     const memoryWorthy = alwaysMemoryWorthy || (event.type === "task_completed" && event.score !== undefined && event.score < 0.5);
     const db = getDatabase();
     const eventId = `evt_${randomUUID()}`;
+    const sessionId = event.session_id ?? new Date(event.ts).toISOString().slice(0, 10);
     if (memoryWorthy) {
       const memoryId = newMemoryId();
       const text = buildMemoryText({ agentName: agent.name, event, eventId });
       const insert = db.transaction(() => {
-        db.prepare(`INSERT INTO events(id,agent_id,type,task_category,summary,details_json,score,cost_usd,correction,ts,memory_status)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(eventId, agent.id, event.type, event.task_category, event.summary,
+        db.prepare(`INSERT INTO events(id,agent_id,type,task_category,summary,details_json,score,cost_usd,correction,ts,session_id,memory_status)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(eventId, agent.id, event.type, event.task_category, event.summary,
           event.details === undefined ? null : JSON.stringify(event.details), event.score ?? null,
-          event.cost_usd ?? null, event.correction ?? null, event.ts, "pending");
+          event.cost_usd ?? null, event.correction ?? null, event.ts, sessionId, "pending");
         db.prepare("INSERT INTO memories(id,event_id,agent_id,text,status,created_at) VALUES(?,?,?,?,?,?)")
           .run(memoryId, eventId, agent.id, text, "pending", new Date().toISOString());
       });
       insert();
       enqueueMemory(memoryId);
     } else {
-      db.prepare(`INSERT INTO events(id,agent_id,type,task_category,summary,details_json,score,cost_usd,correction,ts,memory_status)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(eventId, agent.id, event.type, event.task_category, event.summary,
+      db.prepare(`INSERT INTO events(id,agent_id,type,task_category,summary,details_json,score,cost_usd,correction,ts,session_id,memory_status)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(eventId, agent.id, event.type, event.task_category, event.summary,
         event.details === undefined ? null : JSON.stringify(event.details), event.score ?? null,
-        event.cost_usd ?? null, event.correction ?? null, event.ts, "none");
+        event.cost_usd ?? null, event.correction ?? null, event.ts, sessionId, "none");
     }
     return reply.code(201).send({ event_id: eventId, memory: memoryWorthy ? "queued" : "skipped" });
   });
@@ -340,6 +298,89 @@ export async function buildServer() {
       allowed_vendor_ids_json=excluded.allowed_vendor_ids_json,updated_at=excluded.updated_at`)
       .run(request.params.id, salaryMist.toString(), perTxMist.toString(), periodMist.toString(), JSON.stringify(allowed), new Date().toISOString());
     return { agent_id: request.params.id, salary_sui: formatMist(salaryMist), per_tx_cap_sui: formatMist(perTxMist), period_cap_sui: formatMist(periodMist), allowed_vendor_ids: allowed };
+  });
+
+  app.put("/v1/agents/:id/settings", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    const parsed = settingsSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const settings = parsed.data;
+    getDatabase().prepare(`INSERT INTO agent_settings(agent_id,period,period_minutes,allowance_mist,improvement_reserve_pct,autonomy,auto_limit_mist,rollover,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(agent_id) DO UPDATE SET period=excluded.period, period_minutes=excluded.period_minutes,
+        allowance_mist=excluded.allowance_mist, improvement_reserve_pct=excluded.improvement_reserve_pct,
+        autonomy=excluded.autonomy, auto_limit_mist=excluded.auto_limit_mist, rollover=excluded.rollover,
+        updated_at=excluded.updated_at`).run(
+      request.params.id, settings.period, settings.period_minutes, settings.allowance_mist,
+      settings.improvement_reserve_pct, settings.autonomy, settings.auto_limit_mist,
+      settings.rollover === true || settings.rollover === 1 ? 1 : 0, new Date().toISOString(),
+    );
+    return settingsFor(request.params.id);
+  });
+
+  app.get("/v1/agents/:id/settings", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    return settingsFor(request.params.id);
+  });
+
+  app.post("/v1/agents/:id/review/run", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const parsed = reviewRunSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const result = await runReview({
+      agentId: request.params.id,
+      periodLabel: parsed.data.period_label,
+      windowStart: parsed.data.window_start,
+      windowEnd: parsed.data.window_end,
+    });
+    return reply.code(201).send(result);
+  });
+
+  app.get("/v1/agents/:id/reviews", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    const rows = getDatabase().prepare(`
+      SELECT r.*,
+        (SELECT COUNT(*) FROM gaps g WHERE g.review_id=r.id) AS gap_count,
+        (SELECT COUNT(*) FROM gaps g WHERE g.review_id=r.id AND g.status='passed_gate') AS passed_gap_count
+      FROM reviews r WHERE r.agent_id=? ORDER BY r.created_at DESC, r.rowid DESC
+    `).all(request.params.id);
+    return rows.map(publicReview);
+  });
+
+  app.get("/v1/reviews/:id", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const review = publicReview(getDatabase().prepare("SELECT * FROM reviews WHERE id=?").get(request.params.id));
+    if (!review) return reply.code(404).send({ error: "review not found" });
+    const gaps = getDatabase().prepare("SELECT * FROM gaps WHERE review_id=? ORDER BY priority DESC, task_category").all(request.params.id).map(publicGap);
+    return { ...review, gaps };
+  });
+
+  app.post("/v1/gaps/:id/dismiss", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const db = getDatabase();
+    const gap = db.prepare("SELECT * FROM gaps WHERE id=?").get(request.params.id);
+    if (!gap) return reply.code(404).send({ error: "gap not found" });
+    const memoryId = newMemoryId();
+    const now = new Date().toISOString();
+    const write = db.transaction(() => {
+      db.prepare("INSERT INTO gap_dismissals(agent_id,task_category,taxonomy,created_at) VALUES(?,?,?,?) ON CONFLICT(agent_id,task_category,taxonomy) DO NOTHING")
+        .run(gap.agent_id, gap.task_category, gap.taxonomy, now);
+      db.prepare("UPDATE gaps SET status='dismissed' WHERE id=?").run(gap.id);
+      db.prepare("INSERT INTO memories(id,event_id,agent_id,text,status,created_at) VALUES(?,?,?,?,?,?)")
+        .run(memoryId, null, gap.agent_id, `gap dismissed by user: ${gap.task_category}`, "pending", now);
+    });
+    write();
+    enqueueMemory(memoryId);
+    return {
+      gap_id: gap.id,
+      status: "dismissed",
+      memory_id: memoryId,
+      memory: "queued",
+      gap: publicGap(db.prepare("SELECT * FROM gaps WHERE id=?").get(gap.id)),
+    };
   });
 
   app.get("/v1/agents/:id/balance", async (request, reply) => {
@@ -452,77 +493,81 @@ export async function buildServer() {
     try { amount = suiToMist(parsed.data.amount_sui); }
     catch (error) { return reply.code(400).send({ error: safeText(error.message) }); }
 
-    return withAgentSpendLock(agent.id, async () => {
-      const db = getDatabase();
-      const policy = db.prepare("SELECT * FROM policies WHERE agent_id=?").get(agent.id);
-      const wallet = getWallet("agent", agent.id);
-      const vendor = db.prepare("SELECT * FROM vendors WHERE id=?").get(parsed.data.vendor_id);
-      if (!policy || !wallet) return reply.code(409).send({ error: "agent wallet and policy are required" });
-      const allowedVendors = JSON.parse(policy.allowed_vendor_ids_json);
-      let failedRule = null;
-      if (!vendor || !allowedVendors.includes(parsed.data.vendor_id)) failedRule = "vendor_not_allowed";
-      else if (amount > BigInt(policy.per_tx_cap_mist)) failedRule = "per_tx_cap_exceeded";
-      else if (spentSince(agent.id, periodStart(agent.id)) + amount > BigInt(policy.period_cap_mist)) failedRule = "period_cap_exceeded";
-
-      let balance;
-      if (!failedRule) {
-        balance = await getPayrollBalance(wallet.address);
-        const reserve = suiToMist(getConfig().GAS_RESERVE_SUI);
-        if (balance - amount < reserve) failedRule = "gas_reserve_would_be_breached";
-      }
-
-      const txId = `spend_${randomUUID()}`;
-      const createdAt = new Date().toISOString();
-      if (failedRule) {
-        db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,'blocked',?)`).run(txId, agent.id, "spend", vendor?.address ?? "", amount.toString(), parsed.data.reason, parsed.data.category, vendor?.id ?? null, failedRule, createdAt);
-        if (isMissingCapability(parsed.data.reason)) {
-          const label = vendor?.label ?? parsed.data.vendor_id;
-          insertEvent(agent.id, {
-            type: "capability_missing",
-            task_category: parsed.data.category,
-            summary: `Spend request for ${label} was blocked because a capability is missing: ${parsed.data.reason}`,
-            details: { vendor_id: parsed.data.vendor_id, rule: failedRule, amount_sui: parsed.data.amount_sui },
-            ts: createdAt,
-          });
-        }
-        return reply.code(403).send({ error: "spend blocked by policy", rule: failedRule, transaction_id: txId });
-      }
-
-      try {
-        const confirmation = await transferSui(wallet, vendor.address, amount, {
-          onExecuted: (execution) => db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,checkpoint,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(txId, agent.id, "spend", vendor.address, amount.toString(), parsed.data.reason, parsed.data.category, vendor.id, execution.error ?? "execution_submitted", execution.status, execution.digest, execution.confirmedAt, execution.checkpoint, createdAt),
-        });
-        const confirmedAt = new Date().toISOString();
-        db.prepare(`UPDATE transactions SET rule_result='allowed',status=?,digest=?,confirmed_at=?,checkpoint=? WHERE id=?`)
-          .run(confirmation.status === "success" ? "executed" : confirmation.status, confirmation.digest, confirmation.confirmedAt ?? null, confirmation.checkpoint ?? null, txId);
-
-        const payslip = db.prepare("SELECT * FROM payslips WHERE agent_id=? ORDER BY created_at DESC LIMIT 1").get(agent.id);
-        if (payslip) {
-          const spent = spentSince(agent.id, payslip.created_at);
-          const saved = BigInt(payslip.salary_mist) - spent;
-          db.prepare("UPDATE payslips SET spent_mist=?,saved_mist=? WHERE id=?").run(spent.toString(), saved.toString(), payslip.id);
-        }
-
-        insertEvent(agent.id, {
-          type: "cost_incurred",
-          task_category: parsed.data.category,
-          summary: `Spent ${formatMist(amount)} SUI at ${vendor.label}: ${parsed.data.reason}`,
-          details: { vendor_id: vendor.id, vendor_label: vendor.label, amount_mist: amount.toString(), amount_sui: formatMist(amount), reason: parsed.data.reason, digest: confirmation.digest },
-          ts: confirmedAt,
-        });
-        return reply.code(201).send({ transaction_id: txId, status: confirmation.status, digest: confirmation.digest, amount_mist: amount.toString(), amount_sui: formatMist(amount), vendor_id: vendor.id });
-      } catch (error) {
-          const failure = reportTransferFailure(error);
-        const existing = db.prepare("SELECT id FROM transactions WHERE id=?").get(txId);
-        if (existing) db.prepare("UPDATE transactions SET rule_result=?,status='failed',digest=COALESCE(?,digest),confirmed_at=?,checkpoint=? WHERE id=?")
-          .run(`${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, error.checkpoint ?? null, txId);
-        else db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,reason,category,vendor_id,rule_result,status,digest,confirmed_at,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,'failed',?,?,?)`).run(txId, agent.id, "spend", vendor.address, amount.toString(), parsed.data.reason, parsed.data.category, vendor.id, `${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, new Date().toISOString());
-          return reply.code(502).send({ error: "Sui transfer failed", stage: failure.stage, message: failure.message, transaction_id: txId });
-      }
+    const result = await spendForAgent({
+      agentId: agent.id,
+      vendorId: parsed.data.vendor_id,
+      amountMist: amount,
+      reason: parsed.data.reason,
+      category: parsed.data.category,
     });
+    if (!result.ok) {
+      return reply.code(result.http_status).send({
+        error: result.error,
+        ...(result.rule ? { rule: result.rule } : {}),
+        ...(result.stage ? { stage: result.stage } : {}),
+        ...(result.message ? { message: result.message } : {}),
+        ...(result.transaction_id ? { transaction_id: result.transaction_id } : {}),
+      });
+    }
+    return reply.code(201).send({
+      transaction_id: result.transaction_id,
+      status: result.status,
+      digest: result.digest,
+      amount_mist: result.amount_mist,
+      amount_sui: result.amount_sui,
+      vendor_id: result.vendor_id,
+    });
+  });
+
+  app.get("/v1/catalog", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    return listCatalog();
+  });
+
+  app.post("/v1/reviews/:id/proposals", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const result = await createProposalsForReview({ reviewId: request.params.id });
+    return reply.code(201).send(result);
+  });
+
+  app.get("/v1/requests", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const parsed = requestQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+    return listRequests({ agentId: parsed.data.agent_id, status: parsed.data.status });
+  });
+
+  app.get("/v1/requests/:id", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    return getRequest(request.params.id);
+  });
+
+  app.post("/v1/requests/:id/approve", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const parsed = approveSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const result = await approveRequest({
+      requestId: request.params.id,
+      note: parsed.data.note,
+      extraBudgetSui: parsed.data.extra_budget_sui,
+    });
+    return result;
+  });
+
+  app.post("/v1/requests/:id/reject", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const parsed = rejectSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    return rejectRequest({ requestId: request.params.id, note: parsed.data.note });
+  });
+
+  app.get("/v1/agents/:id/guidance", async (request, reply) => {
+    const token = bearerToken(request);
+    const admin = isAdminToken(token);
+    const agent = admin ? null : agentForToken(token);
+    if (!admin && !agent) return authError(reply);
+    if (!admin && agent.id !== request.params.id) return reply.code(403).send({ error: "forbidden" });
+    return guidanceForAgent(request.params.id);
   });
 
   app.get("/v1/agents/:id/transactions", async (request, reply) => {
