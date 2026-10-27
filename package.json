@@ -17,6 +17,7 @@
     "smoke:block3": "node scripts/smoke-block3.js",
     "smoke:block3b": "node scripts/smoke-block3b.js",
     "smoke:block3c1": "node scripts/smoke-block3c1.js",
+    "score:replay": "node scripts/score-replay.js",
     "demo:cycle": "node scripts/demo-cycle.js",
     "demo:portable": "node scripts/demo-portable.js",
     "debug:transfer": "node scripts/debug-transfer.js",
