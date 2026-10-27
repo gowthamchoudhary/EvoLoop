@@ -418,6 +418,8 @@ export async function proposeCheckForAgent({ agentId, capabilityKey }) {
 
   return {
     agent_id: agentId,
+    latest_score: (()=>{const row=db.prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(agentId);return row?{...row,components:JSON.parse(row.components_json)}:null;})(),
+    pending_suggestion: (()=>{const row=db.prepare("SELECT * FROM salary_suggestions WHERE agent_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(agentId);return row?{...row,reasons:JSON.parse(row.reasons_json)}:null;})(),
     capability_key: capabilityKey,
     ...(catalog ? { catalog_id: catalog.id, cost_sui: formatMist(BigInt(catalog.price_mist)) } : {}),
     would_propose: wouldPropose,
