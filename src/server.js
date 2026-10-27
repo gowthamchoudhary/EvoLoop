@@ -7,12 +7,16 @@ import { closeDatabase, getDatabase, initDatabase } from "./db.js";
 import { buildMemoryText, enqueueMemory, newMemoryId, recallForAgent, resumePendingMemories } from "./memory-queue.js";
 import { closePayrollChain, formatMist, getPayrollBalance, getPayrollBalanceBreakdown, suiToMist, transferSui, verifyTransaction } from "./payroll-chain.js";
 import { createWallet, getWallet } from "./wallets.js";
-import { getTatumActivity } from "./tatum.js";
 import { publicGap, publicReview, runReview } from "./review.js";
 import { reportTransferFailure, safeText } from "./events.js";
 import { periodStart, spendForAgent, spentSince } from "./spend.js";
 import { settingsFor } from "./settings.js";
-import { approveRequest, createProposalsForReview, getRequest, guidanceForAgent, listCatalog, listRequests, rejectRequest } from "./upgrades.js";
+import { approveRequest, createProposalsForReview, getRequest, guidanceForAgent, listCatalog, listRequests, proposeCheckForAgent, rejectRequest } from "./upgrades.js";
+import { lessonsForAgent, recallLessons, restoreLessons } from "./lessons.js";
+import { PREMIUM_VERIFY_POLL_MS } from "./premium-config.js";
+import { consumeCall, paymentRequired, passStatus, publicPass, recordPremiumCall, verifyReceipt } from "./premium.js";
+import { getRate, getTatumActivity } from "./tatum.js";
+import { evaluateVerdict, listVerdicts } from "./verdicts.js";
 
 export const eventTypes = z.enum([
   "task_completed",
@@ -74,6 +78,19 @@ const requestQuerySchema = z.object({
   agent_id: z.string().min(1).optional(),
   status: z.enum(["needs_raise", "pending_approval", "auto_approved", "approved", "rejected", "executed", "failed", "note_only"]).optional(),
 });
+const claimSchema = z.object({
+  digest: z.string().trim().min(1).max(128),
+  poll_timeout_ms: z.number().int().min(500).max(40_000).optional(),
+});
+const premiumQuerySchema = z.object({
+  type: z.enum(["price", "balance"]),
+  symbol: z.string().trim().regex(/^[A-Za-z0-9]{1,10}$/).default("SUI"),
+  currency: z.string().trim().regex(/^[A-Za-z]{3}$/).default("USD"),
+  address: z.string().trim().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
+}).refine((value) => value.type !== "balance" || Boolean(value.address), {
+  message: "address (0x + 64 hex) is required for type=balance",
+  path: ["address"],
+});
 const reviewRunSchema = z.object({
   period_label: z.string().trim().min(1).max(100).optional(),
   window_start: z.string().datetime({ offset: true }).optional(),
@@ -92,6 +109,12 @@ const spendSchema = z.object({
   amount_sui: z.number().positive(),
   reason: z.string().trim().min(1).max(500),
   category: z.string().trim().min(1).max(100),
+});
+const importAgentSchema = z.object({
+  agent_id: z.string().trim().regex(/^[a-zA-Z0-9_-]{1,64}$/, "agent_id must be 1-64 url-safe characters"),
+  name: z.string().trim().min(1).max(100),
+  kind: z.string().trim().min(1).max(50),
+  description: z.string().trim().max(500).default(""),
 });
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const equalHash = (left, right) => {
@@ -169,6 +192,57 @@ export async function buildServer() {
     db.prepare("INSERT INTO agents(id,name,kind,description,api_key_hash,created_at) VALUES(?,?,?,?,?,?)")
       .run(id, parsed.data.name, parsed.data.kind, parsed.data.description, sha256(apiKey), new Date().toISOString());
     return reply.code(201).send({ agent_id: id, api_key: apiKey });
+  });
+
+  /** Creates an agent with an EXACT id so the Walrus namespace `prefix:agent_id` can be reused. */
+  app.post("/v1/agents/import", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const parsed = importAgentSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const db = getDatabase();
+    if (db.prepare("SELECT 1 FROM agents WHERE id=?").get(parsed.data.agent_id)) {
+      return reply.code(409).send({ error: "agent already exists", agent_id: parsed.data.agent_id });
+    }
+    const apiKey = `plk_${randomBytes(32).toString("hex")}`;
+    db.prepare("INSERT INTO agents(id,name,kind,description,api_key_hash,created_at) VALUES(?,?,?,?,?,?)")
+      .run(parsed.data.agent_id, parsed.data.name, parsed.data.kind, parsed.data.description, sha256(apiKey), new Date().toISOString());
+    return reply.code(201).send({ agent_id: parsed.data.agent_id, api_key: apiKey, imported: true });
+  });
+
+  /** Lessons recalled from the agent's own Walrus namespace (refresh=1 forces recall). */
+  app.get("/v1/agents/:id/lessons", async (request, reply) => {
+    const token = bearerToken(request);
+    const admin = isAdminToken(token);
+    const agent = admin ? null : agentForToken(token);
+    if (!admin && !agent) return authError(reply);
+    if (!admin && agent.id !== request.params.id) return reply.code(403).send({ error: "forbidden" });
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    const recall = await recallLessons(request.params.id, { force: request.query.refresh === "1" });
+    const rows = lessonsForAgent(request.params.id).map((lesson) => ({
+      kind: lesson.kind,
+      capability_key: lesson.capability_key,
+      task_category: lesson.task_category,
+      verdict: lesson.verdict,
+      detail: lesson.detail,
+      blob_id: lesson.blob_id,
+      recalled_at: lesson.recalled_at,
+    }));
+    return { agent_id: request.params.id, recall_ok: recall.ok, recall_error: recall.error ?? null, count: rows.length, lessons: rows };
+  });
+
+  /** Force a recall and report what Walrus returned, parsed by kind. */
+  app.post("/v1/agents/:id/lessons/restore", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    return restoreLessons(request.params.id);
+  });
+
+  /** Dry-run of proposal creation for one capability; nothing is created. */
+  app.get("/v1/agents/:id/propose-check", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    const capabilityKey = String(request.query.capability_key ?? "").trim();
+    if (!capabilityKey) return reply.code(400).send({ error: "capability_key is required" });
+    return proposeCheckForAgent({ agentId: request.params.id, capabilityKey });
   });
 
   app.post("/v1/events", async (request, reply) => {
@@ -370,7 +444,7 @@ export async function buildServer() {
         .run(gap.agent_id, gap.task_category, gap.taxonomy, now);
       db.prepare("UPDATE gaps SET status='dismissed' WHERE id=?").run(gap.id);
       db.prepare("INSERT INTO memories(id,event_id,agent_id,text,status,created_at) VALUES(?,?,?,?,?,?)")
-        .run(memoryId, null, gap.agent_id, `gap dismissed by user: ${gap.task_category}`, "pending", now);
+        .run(memoryId, null, gap.agent_id, `Agent ${gap.agent_id} | gap_dismissed | ${gap.task_category}`, "pending", now);
     });
     write();
     enqueueMemory(memoryId);
@@ -561,6 +635,17 @@ export async function buildServer() {
     return rejectRequest({ requestId: request.params.id, note: parsed.data.note });
   });
 
+  app.post("/v1/requests/:id/verdict/evaluate", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    return evaluateVerdict({ requestId: request.params.id });
+  });
+
+  app.get("/v1/agents/:id/verdicts", async (request, reply) => {
+    if (!isAdminToken(bearerToken(request))) return authError(reply);
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    return listVerdicts(request.params.id);
+  });
+
   app.get("/v1/agents/:id/guidance", async (request, reply) => {
     const token = bearerToken(request);
     const admin = isAdminToken(token);
@@ -568,6 +653,83 @@ export async function buildServer() {
     if (!admin && !agent) return authError(reply);
     if (!admin && agent.id !== request.params.id) return reply.code(403).send({ error: "forbidden" });
     return guidanceForAgent(request.params.id);
+  });
+
+  app.post("/v1/premium/claim", async (request, reply) => {
+    const agent = agentForToken(bearerToken(request));
+    if (!agent) return authError(reply);
+    const parsed = claimSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const digest = parsed.data.digest;
+    let verification;
+    try {
+      verification = await verifyReceipt(agent, digest, { pollTimeoutMs: parsed.data.poll_timeout_ms ?? PREMIUM_VERIFY_POLL_MS });
+    } catch (error) {
+      recordPremiumCall(agent.id, "claim", "verification_error", safeText(error.message));
+      return reply.code(502).send({ error: "verification_unavailable", detail: safeText(error.message) });
+    }
+    if (!verification.ok) {
+      recordPremiumCall(agent.id, "claim", verification.code, digest);
+      const conflict = verification.code === "already_claimed" || verification.code === "claimed_by_other_agent";
+      return reply.code(conflict ? 409 : 400).send({
+        error: verification.code,
+        ...(verification.detail ? { detail: safeText(verification.detail) } : {}),
+        ...(verification.required_sui ? { required_sui: verification.required_sui, received_mist: verification.received_mist } : {}),
+      });
+    }
+    recordPremiumCall(agent.id, "claim", "ok", digest);
+    return reply.code(201).send({
+      calls_granted: verification.calls_granted,
+      calls_remaining: verification.calls_granted,
+      expires_at: verification.expires_at,
+      receipt: publicPass(verification.receipt),
+    });
+  });
+
+  app.get("/v1/premium/data", async (request, reply) => {
+    const agent = agentForToken(bearerToken(request));
+    if (!agent) return authError(reply);
+    const parsed = premiumQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+    const { type, symbol, currency, address } = parsed.data;
+
+    const remaining = consumeCall(agent.id);
+    if (remaining === null) {
+      recordPremiumCall(agent.id, type, "payment_required");
+      return reply.code(402).send(paymentRequired());
+    }
+    try {
+      if (type === "price") {
+        const rate = await getRate(symbol, currency);
+        recordPremiumCall(agent.id, type, "ok", `${rate.symbol}/${rate.basePair}`);
+        return { type, symbol: rate.symbol, currency: rate.basePair, value: rate.value, timestamp: rate.timestamp, source: rate.source, calls_remaining: remaining };
+      }
+      const balance = await getPayrollBalanceBreakdown(address, { bypassCache: true });
+      recordPremiumCall(agent.id, type, "ok", address);
+      return {
+        type,
+        address,
+        balance_sui: formatMist(balance.totalBalance),
+        balance_mist: balance.totalBalance.toString(),
+        coin_objects_sui: formatMist(balance.coinBalance),
+        address_balance_sui: formatMist(balance.addressBalance),
+        source: "tatum-grpc",
+        calls_remaining: remaining,
+      };
+    } catch (error) {
+      recordPremiumCall(agent.id, type, "error", safeText(error.message));
+      return reply.code(502).send({ error: "upstream_unavailable", detail: safeText(error.message), calls_remaining: remaining });
+    }
+  });
+
+  app.get("/v1/agents/:id/premium", async (request, reply) => {
+    const token = bearerToken(request);
+    const admin = isAdminToken(token);
+    const agent = admin ? null : agentForToken(token);
+    if (!admin && !agent) return authError(reply);
+    if (!admin && agent.id !== request.params.id) return reply.code(403).send({ error: "forbidden" });
+    if (!getDatabase().prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id)) return reply.code(404).send({ error: "agent not found" });
+    return passStatus(request.params.id);
   });
 
   app.get("/v1/agents/:id/transactions", async (request, reply) => {

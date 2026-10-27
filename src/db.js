@@ -201,7 +201,49 @@ export function initDatabase() {
       unlocked_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS agent_capabilities_agent ON agent_capabilities(agent_id, active);
+    CREATE TABLE IF NOT EXISTS payment_receipts (
+      digest TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      vendor_id TEXT NOT NULL REFERENCES vendors(id),
+      amount_mist TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      verified_at TEXT NOT NULL,
+      calls_granted INTEGER NOT NULL,
+      calls_used INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active','exhausted','expired'))
+    );
+    CREATE INDEX IF NOT EXISTS payment_receipts_agent ON payment_receipts(agent_id, status);
+    CREATE TABLE IF NOT EXISTS premium_calls (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      type TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS premium_calls_agent ON premium_calls(agent_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS upgrade_verdicts (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL REFERENCES upgrade_requests(id),
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      capability_key TEXT NOT NULL,
+      task_category TEXT NOT NULL,
+      baseline_rate REAL NOT NULL,
+      baseline_outcomes INTEGER NOT NULL,
+      after_rate REAL NOT NULL,
+      after_outcomes INTEGER NOT NULL,
+      delta REAL NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('worth_it','not_worth_it','inconclusive')),
+      cost_mist TEXT NOT NULL,
+      evaluated_at TEXT NOT NULL,
+      summary TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS upgrade_verdicts_agent ON upgrade_verdicts(agent_id, evaluated_at DESC);
+    CREATE INDEX IF NOT EXISTS upgrade_verdicts_request ON upgrade_verdicts(request_id);
   `);
+  const capabilityColumns = database.prepare("PRAGMA table_info(agent_capabilities)").all().map((column) => column.name);
+  if (capabilityColumns.length > 0 && !capabilityColumns.includes("note")) database.exec("ALTER TABLE agent_capabilities ADD COLUMN note TEXT");
   const eventColumns = database.prepare("PRAGMA table_info(events)").all().map((column) => column.name);
   if (!eventColumns.includes("session_id")) database.exec("ALTER TABLE events ADD COLUMN session_id TEXT");
   const memorySchema = database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get()?.sql ?? "";
@@ -260,6 +302,22 @@ export function initDatabase() {
       CREATE INDEX IF NOT EXISTS transactions_kind_status ON transactions(kind, status);
     `);
   }
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS lessons (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      kind TEXT NOT NULL,
+      capability_key TEXT,
+      task_category TEXT,
+      verdict TEXT,
+      detail TEXT,
+      source_text TEXT NOT NULL,
+      blob_id TEXT,
+      recalled_at TEXT NOT NULL,
+      UNIQUE(agent_id, source_text)
+    );
+    CREATE INDEX IF NOT EXISTS lessons_agent_kind ON lessons(agent_id, kind);
+  `);
   return database;
 }
 

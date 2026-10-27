@@ -292,7 +292,7 @@ try {
     assert(data.status === "dismissed", `Dismiss returned status ${data.status}`);
     assert(data.gap.status === "dismissed", "Gap row was not marked dismissed");
     const memories = requireStatus(await request("/v1/memories", { token: config.ADMIN_TOKEN }), 200, "List memories");
-    const dismissal = memories.find((row) => row.agent_id === state.agentId && String(row.text) === "gap dismissed by user: finance_qa");
+    const dismissal = memories.find((row) => row.agent_id === state.agentId && String(row.text) === `Agent ${state.agentId} | gap_dismissed | finance_qa`);
     assert(dismissal, "No dismissal memory was queued");
     return `gap dismissed; memory ${dismissal.status}`;
   });

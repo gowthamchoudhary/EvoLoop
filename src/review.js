@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { getDatabase } from "./db.js";
+import { lessonDismissalFor, lessonsForAgent, recallLessons } from "./lessons.js";
 import { enqueueMemory, newMemoryId } from "./memory-queue.js";
+import { formatMist } from "./payroll-chain.js";
 import {
   CAPABILITY_MISSING_TAXONOMY,
   DEFAULT_TAXONOMY,
@@ -211,16 +213,24 @@ async function describeWithGroq({ agentId, taskCategory, taxonomy, metrics, evid
   return { description, fix_type: parsed.fix_type, model };
 }
 
-function summarize({ outcome, categoryCount, totalOutcomes, categoryNames, passed, rejected, dismissed }) {
+function verdictClause(verdicts) {
+  if (!verdicts.length) return "";
+  const parts = verdicts.map((row) =>
+    ` ${row.capability_key} on ${row.task_category}: issue rate ${Math.round(row.baseline_rate * 100)}% -> ${Math.round(row.after_rate * 100)}% over ${row.after_outcomes} task(s), verdict ${row.verdict} (cost ${formatMist(row.cost_mist)} SUI).`);
+  return ` Upgrade verdicts:${parts.join("")}`;
+}
+
+function summarize({ outcome, categoryCount, totalOutcomes, categoryNames, passed, rejected, dismissed, verdicts = [] }) {
+  const verdictsText = verdictClause(verdicts);
   if (outcome === "insufficient_data") {
-    return `Insufficient data: ${totalOutcomes} outcome(s) across ${categoryCount} category(ies); each category needs at least ${MIN_OUTCOMES} outcomes before gaps can be reported.`;
+    return `Insufficient data: ${totalOutcomes} outcome(s) across ${categoryCount} category(ies); each category needs at least ${MIN_OUTCOMES} outcomes before gaps can be reported.${verdictsText}`;
   }
   if (outcome === "no_gaps") {
-    return `No gaps this period: reviewed ${totalOutcomes} outcomes across ${categoryCount} categories; ${categoryNames} had enough data but none passed the evidence gate.`;
+    return `No gaps this period: reviewed ${totalOutcomes} outcomes across ${categoryCount} categories; ${categoryNames} had enough data but none passed the evidence gate.${verdictsText}`;
   }
-  const passedList = passed.map((gap) => `${gap.task_category} (${gap.taxonomy}, ${gap.priority_label} priority)`).join(", ");
+  const passedList = passed.map((gap) => `${gap.task_category ?? gap.taskCategory} (${gap.taxonomy}, ${gap.priority_label ?? gap.priorityLabel} priority)`).join(", ");
   const extra = rejected + dismissed > 0 ? ` ${rejected} categor${rejected === 1 ? "y" : "ies"} rejected by the gate and ${dismissed} dismissed by the user.` : "";
-  return `Found ${passed.length} gap(s) in ${totalOutcomes} outcomes across ${categoryCount} categories: ${passedList}.${extra}`;
+  return `Found ${passed.length} gap(s) in ${totalOutcomes} outcomes across ${categoryCount} categories: ${passedList}.${extra}${verdictsText}`;
 }
 
 /**
@@ -246,6 +256,11 @@ export async function runReview({ agentId, periodLabel, windowStart, windowEnd }
     db.prepare("SELECT task_category,taxonomy FROM gap_dismissals WHERE agent_id=?").all(agentId)
       .map((row) => dismissalKey(row.task_category, row.taxonomy)),
   );
+
+  // Walrus lessons are consulted together with the database: a recalled gap_dismissed lesson for
+  // the same task_category blocks that category in the gate even when this database has no row.
+  const lessonResult = await recallLessons(agentId, { force: false });
+  const lessons = lessonResult.ok ? lessonsForAgent(agentId) : [];
 
   const byCategory = new Map();
   for (const event of events) {
@@ -283,6 +298,15 @@ export async function runReview({ agentId, periodLabel, windowStart, windowEnd }
     }
     if (dismissals.has(dismissalKey(taskCategory, taxonomy))) {
       reasons.push({ code: "dismissed_by_user", detail: `${taskCategory}/${taxonomy} was dismissed by the user` });
+    }
+    // Either state dismisses; the walrus lesson dominates even when this database is fresh.
+    const dismissalLesson = lessons.length ? lessonDismissalFor(lessons, taskCategory) : null;
+    if (dismissalLesson) {
+      reasons.push({
+        code: "dismissed_by_user",
+        detail: `${taskCategory} was dismissed by the user${dismissalLesson.blob_id ? ` (walrus lesson ${dismissalLesson.blob_id})` : " (walrus lesson)"}`,
+        ...(dismissalLesson.blob_id ? { blob_id: dismissalLesson.blob_id } : {}),
+      });
     }
 
     const status = reasons.some((reason) => reason.code === "dismissed_by_user")
@@ -338,6 +362,13 @@ export async function runReview({ agentId, periodLabel, windowStart, windowEnd }
     }
   }));
 
+  // Verdicts already recorded for categories in this window are folded into the summary text.
+  const categories = Object.keys(categoryMetrics);
+  const verdicts = categories.length
+    ? db.prepare(`SELECT * FROM upgrade_verdicts WHERE agent_id=? AND task_category IN (${categories.map(() => "?").join(",")}) ORDER BY evaluated_at DESC, rowid DESC LIMIT 3`)
+      .all(agentId, ...categories)
+    : [];
+
   const summary = summarize({
     outcome,
     categoryCount: byCategory.size,
@@ -346,10 +377,12 @@ export async function runReview({ agentId, periodLabel, windowStart, windowEnd }
     passed,
     rejected: pending.filter((gap) => gap.status === "rejected_gate").length,
     dismissed: pending.filter((gap) => gap.status === "dismissed").length,
+    verdicts,
   });
 
   const metricsJson = {
     window,
+    walrus_lessons: lessonResult.ok ? { ok: true, used: lessons.length } : { ok: false, error: lessonResult.error ?? "recall failed" },
     categories: categoryMetrics,
     thresholds: {
       min_outcomes: MIN_OUTCOMES,
