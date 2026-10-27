@@ -241,6 +241,22 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS upgrade_verdicts_agent ON upgrade_verdicts(agent_id, evaluated_at DESC);
     CREATE INDEX IF NOT EXISTS upgrade_verdicts_request ON upgrade_verdicts(request_id);
+    CREATE TABLE IF NOT EXISTS agent_scores (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), period_label TEXT NOT NULL,
+      window_start TEXT NOT NULL, window_end TEXT NOT NULL, score REAL,
+      status TEXT NOT NULL CHECK(status IN ('scored','insufficient_data')), components_json TEXT NOT NULL,
+      outcomes INTEGER NOT NULL, issue_rate REAL, spent_mist TEXT NOT NULL, allowance_mist TEXT NOT NULL,
+      created_at TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('live','replay'))
+    );
+    CREATE INDEX IF NOT EXISTS agent_scores_agent_created ON agent_scores(agent_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS salary_suggestions (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), score_id TEXT NOT NULL REFERENCES agent_scores(id),
+      kind TEXT NOT NULL CHECK(kind IN ('raise','probation','hold')), current_allowance_mist TEXT NOT NULL,
+      suggested_allowance_mist TEXT NOT NULL, reasons_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending','accepted','dismissed','superseded')),
+      decided_note TEXT, created_at TEXT NOT NULL, decided_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS salary_suggestions_agent_created ON salary_suggestions(agent_id, created_at DESC);
   `);
   const capabilityColumns = database.prepare("PRAGMA table_info(agent_capabilities)").all().map((column) => column.name);
   if (capabilityColumns.length > 0 && !capabilityColumns.includes("note")) database.exec("ALTER TABLE agent_capabilities ADD COLUMN note TEXT");
