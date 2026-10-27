@@ -11,6 +11,7 @@ const queued = new Set();
 let active = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const isRateLimit = (error) => error?.status === 429 || /rate limit exceeded/i.test(String(error?.message ?? error));
 const safeError = (error) => {
   const config = getConfig();
   let message = error instanceof Error ? error.message : String(error);
@@ -83,9 +84,17 @@ async function writeMemory(memoryId) {
   const client = memoryClientForAgent(row.agent_id);
   let lastError;
 
+  // The relayer rate limit is 60 weighted requests/min and reports retry_after_seconds.
+  const retryAfterMs = (error) => {
+    const match = /"retry_after_seconds"\s*:\s*(\d+)/.exec(String(error?.message ?? error));
+    const seconds = match ? Number(match[1]) : 0;
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 120_000) : 0;
+  };
+
   for (let attempt = 1; attempt <= retryDelaysMs.length + 1; attempt += 1) {
     db.prepare("UPDATE memories SET attempts=? WHERE id=?").run(attempt, memoryId);
     let jobId;
+    let rateWait = 0;
     try {
       const job = await client.remember(row.text);
       jobId = job.job_id;
@@ -102,11 +111,17 @@ async function writeMemory(memoryId) {
           return;
         }
       } catch (recallError) {
-        saveFailed(memoryId, new Error(`${safeError(error)}; cannot check recall before retry: ${safeError(recallError)}`));
-        return;
+        // A rate-limited recall check is transient, like the write itself, not a reason to give up.
+        if (isRateLimit(recallError)) {
+          rateWait = Math.max(rateWait, retryAfterMs(recallError));
+        } else {
+          saveFailed(memoryId, new Error(`${safeError(error)}; cannot check recall before retry: ${safeError(recallError)}`));
+          return;
+        }
       }
       if (attempt > retryDelaysMs.length) break;
-      await sleep(retryDelaysMs[attempt - 1]);
+      if (isRateLimit(error) || rateWait > 0) rateWait = Math.max(rateWait, retryAfterMs(error), 30_000);
+      await sleep(Math.max(retryDelaysMs[attempt - 1], rateWait));
     }
   }
   saveFailed(memoryId, lastError ?? new Error("Memory write failed"));

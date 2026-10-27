@@ -3,15 +3,26 @@ import { computeBudget, decideStatus, periodWindow } from "./budget.js";
 import { getConfig } from "./config.js";
 import { getDatabase } from "./db.js";
 import { reportTransferFailure, safeText } from "./events.js";
-import { enqueueMemory, newMemoryId, recallForAgent } from "./memory-queue.js";
+import { enqueueMemory, newMemoryId } from "./memory-queue.js";
 import { formatMist, getPayrollBalance, suiToMist, transferSui } from "./payroll-chain.js";
+import {
+  decisionBasisForWalrus,
+  lessonDismissalFor,
+  lessonSkipReason,
+  lessonsForAgent,
+  recallLessons,
+} from "./lessons.js";
 import { MIN_ISSUE_RATE, PROPOSAL_COOLDOWN_MINUTES, REJECT_COOLDOWN_DAYS, UPGRADE_TOPUP_GAS_MARGIN_MIST } from "./review-config.js";
+import { PREMIUM_CAPABILITY_KEY } from "./premium-config.js";
+import { passStatus, verifyReceipt } from "./premium.js";
 import { settingsFor } from "./settings.js";
 import { spendForAgent, withAgentSpendLock } from "./spend.js";
+import { verdictBlocking } from "./verdicts.js";
 import { getWallet } from "./wallets.js";
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
+const excerpt = (value, max = 120) => String(value ?? "").slice(0, max);
 const NON_FINAL_STATUSES = ["pending_approval", "approved", "auto_approved", "needs_raise"];
 const DECIDABLE_STATUSES = ["pending_approval", "needs_raise"];
 
@@ -147,12 +158,27 @@ export function listCatalog() {
  * Deterministic planning pass for one review. Gaps are processed by task_category (then priority
  * descending) and every purchase planned in this pass reserves its cost for the following ones, so
  * the improvement budget is never committed twice inside one run.
+ *
+ * Before planning, the agent's Walrus namespace is recalled for lessons; the lessons and the
+ * database state are consulted together, and skip if EITHER says skip. Every skipped or created
+ * request records the consulted evidence as decision_basis in its budget_json.
  */
 export async function createProposalsForReview({ reviewId }) {
   const db = getDatabase();
   const review = db.prepare("SELECT * FROM reviews WHERE id=?").get(reviewId);
   if (!review) throw httpError(404, "review not found");
   const settings = settingsFor(review.agent_id);
+  const lessonResult = await recallLessons(review.agent_id, { force: false });
+  const lessons = lessonResult.ok ? lessonsForAgent(review.agent_id) : [];
+  const decisionBasisNote = lessonResult.ok ? undefined : "walrus_recall_failed_used_database";
+
+  const dbBasis = (kind, capabilityKey, text) => ({
+    source: "database",
+    kind,
+    capability_key: capabilityKey ?? null,
+    ...(text ? { text_excerpt: excerpt(JSON.stringify(text)) } : {}),
+  });
+
   const window = periodWindow(settings);
   const wallet = getWallet("agent", review.agent_id);
   const balance = wallet ? await getPayrollBalance(wallet.address, { bypassCache: true }) : 0n;
@@ -194,17 +220,54 @@ export async function createProposalsForReview({ reviewId }) {
     }
 
     const owned = activeCapability(gap.agent_id, catalog.capability_key);
+    const basis = [owned
+      ? dbBasis("capability_already_active", catalog.capability_key, `active capability unlocked at ${owned.unlocked_at}`)
+      : null].filter(Boolean);
     if (owned) {
-      skipped.push({ gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key, reason: "capability_already_active" });
+      skipped.push({
+        gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key,
+        reason: "capability_already_active", decision_basis: basis, decision_basis_note: decisionBasisNote ?? null,
+      });
       continue;
     }
     const blocking = blockingRequest(gap.agent_id, catalog.capability_key, gap, settings);
     if (blocking) {
-      skipped.push({ gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key, ...blocking });
+      skipped.push({
+        gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key,
+        ...blocking, decision_basis: [...basis, dbBasis(blocking.reason, catalog.capability_key, blocking)], decision_basis_note: decisionBasisNote ?? null,
+      });
+      continue;
+    }
+    const verdictBlock = verdictBlocking(gap.agent_id, catalog.capability_key, settings);
+    if (verdictBlock) {
+      skipped.push({
+        gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key,
+        ...verdictBlock, decision_basis: [...basis, dbBasis(verdictBlock.reason, catalog.capability_key, verdictBlock)], decision_basis_note: decisionBasisNote ?? null,
+      });
+      continue;
+    }
+    // Walrus lessons do their own blocking check (cooldown windows per the agent's settings).
+    const lessonBlock = lessonSkipReason(lessons, catalog.capability_key, settings);
+    if (lessonBlock) {
+      skipped.push({
+        gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key,
+        ...lessonBlock, decision_basis: decisionBasisForWalrus(lessons, { capabilityKey: catalog.capability_key, taskCategory: gap.task_category }),
+        decision_basis_note: decisionBasisNote ?? null,
+      });
+      continue;
+    }
+    const dismissalLesson = lessonDismissalFor(lessons, gap.task_category);
+    if (dismissalLesson) {
+      skipped.push({
+        gap_id: gap.id, task_category: gap.task_category, capability_key: catalog.capability_key,
+        reason: "lesson_gap_dismissed", kind: dismissalLesson.kind, blob_id: dismissalLesson.blob_id,
+        decision_basis: decisionBasisForWalrus(lessons, { capabilityKey: catalog.capability_key, taskCategory: gap.task_category }),
+        decision_basis_note: decisionBasisNote ?? null,
+      });
       continue;
     }
 
-    const budget = computeBudget({
+    const budgetNumbers = computeBudget({
       settings,
       costMist: catalog.price_mist,
       periodSpentMist: periodSpent,
@@ -213,10 +276,20 @@ export async function createProposalsForReview({ reviewId }) {
       balanceMist: balance,
       gasReserveMist: reserve,
     });
-    const status = decideStatus(settings, budget);
+    const status = decideStatus(settings, budgetNumbers);
     let note = null;
-    if (status === "needs_raise") note = `improvement budget short by ${formatMist(BigInt(budget.shortfall_mist))} SUI`;
+    if (status === "needs_raise") note = `improvement budget short by ${formatMist(BigInt(budgetNumbers.shortfall_mist))} SUI`;
     if (status === "note_only") note = "autonomy is never; recorded without spending";
+    // Created requests record the consulted lesson and database-evidence basis too.
+    const decisionBasis = [
+      dbBasis("gate_passed", catalog.capability_key, `gap passed for ${gap.task_category}`),
+      ...decisionBasisForWalrus(lessons, { capabilityKey: catalog.capability_key, taskCategory: gap.task_category }),
+    ];
+    const budget = {
+      ...budgetNumbers,
+      decision_basis: decisionBasis,
+      ...(decisionBasisNote ? { decision_basis_note: decisionBasisNote } : {}),
+    };
 
     const requestId = insertRequest({
       gap, catalog, status, costMist: catalog.price_mist, expectedBenefit, baseline, budget, note,
@@ -237,6 +310,122 @@ export async function createProposalsForReview({ reviewId }) {
     window_end: window.end,
     requests,
     skipped,
+    skipped_proposals: skipped,
+    ...(decisionBasisNote ? { decision_basis_note: decisionBasisNote } : {}),
+  };
+}
+
+/**
+ * Dry-run of proposal creation for one capability: the same lessons + database blockers as
+ * createProposalsForReview, the same budget/autonomy computation, but nothing is created.
+ */
+export async function proposeCheckForAgent({ agentId, capabilityKey }) {
+  const db = getDatabase();
+  if (!db.prepare("SELECT 1 FROM agents WHERE id=?").get(agentId)) throw httpError(404, "agent not found");
+  const settings = settingsFor(agentId);
+  const lessonResult = await recallLessons(agentId, { force: false });
+  const lessons = lessonResult.ok ? lessonsForAgent(agentId) : [];
+  const decisionBasisNote = lessonResult.ok ? undefined : "walrus_recall_failed_used_database";
+
+  const reasons = [];
+  const decisionBasis = [];
+  const dbBasis = (kind, text) => {
+    decisionBasis.push({ source: "database", kind, capability_key: capabilityKey ?? null, ...(text ? { text_excerpt: excerpt(JSON.stringify(text)) } : {}) });
+  };
+
+  const catalog = db.prepare(`
+    SELECT c.*, v.label AS vendor_label
+    FROM upgrade_catalog c JOIN vendors v ON v.id = c.vendor_id
+    WHERE c.active = 1 AND c.capability_key=?
+    ORDER BY c.price_mist ASC, c.id ASC
+  `).get(capabilityKey);
+  if (!catalog) {
+    reasons.push({ reason: "no_active_catalog_item", source: "database" });
+    dbBasis("no_active_catalog_item", null);
+  }
+
+  const owned = activeCapability(agentId, capabilityKey);
+  if (owned) {
+    reasons.push({ reason: "capability_already_active", source: "database", unlocked_at: owned.unlocked_at });
+    dbBasis("capability_already_active", `active capability unlocked at ${owned.unlocked_at}`);
+  }
+  const open = db.prepare(`
+    SELECT id,status FROM upgrade_requests
+    WHERE agent_id=? AND capability_key=? AND status IN (${NON_FINAL_STATUSES.map(() => "?").join(",")})
+    ORDER BY created_at DESC, rowid DESC LIMIT 1
+  `).get(agentId, capabilityKey, ...NON_FINAL_STATUSES);
+  if (open) {
+    reasons.push({ reason: "request_already_open", source: "database", status: open.status, request_id: open.id });
+    dbBasis("request_already_open", open);
+  }
+  const rejected = db.prepare("SELECT * FROM upgrade_requests WHERE agent_id=? AND capability_key=? AND status='rejected' ORDER BY decided_at DESC, rowid DESC LIMIT 1")
+    .get(agentId, capabilityKey);
+  if (rejected) {
+    // No gap in play here, so use the most favourable priority: only a fresh rejection blocks.
+    const gapPriority = 1;
+    const rejectedPriority = Number(parseJson(rejected.baseline_json)?.priority ?? 0);
+    if (gapPriority <= rejectedPriority || Number.isFinite(rejectedPriority) === false) {
+      const cooldownMs = settings.period === "compressed" ? PROPOSAL_COOLDOWN_MINUTES * MINUTE_MS : REJECT_COOLDOWN_DAYS * DAY_MS;
+      const decidedAt = Date.parse(rejected.decided_at ?? rejected.created_at);
+      if (Number.isFinite(decidedAt) && Date.now() - decidedAt < cooldownMs) {
+        reasons.push({ reason: "rejected_cooldown", source: "database", request_id: rejected.id, cooldown_hours: cooldownMs / 3_600_000 });
+        dbBasis("rejected_cooldown", { request_id: rejected.id, decided_at: rejected.decided_at });
+      }
+    }
+  }
+  const verdictBlock = verdictBlocking(agentId, capabilityKey, settings);
+  if (verdictBlock) {
+    reasons.push({ reason: "verdict_cooldown", source: "database", ...verdictBlock });
+    dbBasis("verdict_cooldown", verdictBlock);
+  }
+
+  const lessonBlock = lessonSkipReason(lessons, capabilityKey, settings);
+  if (lessonBlock) {
+    reasons.push({ reason: lessonBlock.reason, source: "walrus", kind: lessonBlock.kind, blob_id: lessonBlock.blob_id ?? null });
+  }
+  const walrusBasis = decisionBasisForWalrus(lessons, { capabilityKey });
+  decisionBasis.push(...walrusBasis);
+
+  const wouldPropose = reasons.length === 0;
+  let status = null;
+  let budget = null;
+  if (wouldPropose && catalog) {
+    const window = periodWindow(settings);
+    const wallet = getWallet("agent", agentId);
+    let balance = 0n;
+    try {
+      balance = wallet ? await getPayrollBalance(wallet.address, { bypassCache: true }) : 0n;
+    } catch {
+      balance = 0n;
+    }
+    budget = computeBudget({
+      settings,
+      costMist: catalog.price_mist,
+      periodSpentMist: periodSpentTotal(agentId, window.start),
+      improvementSpentMist: improvementSpentTotal(agentId, window.start),
+      reservedMist: 0n,
+      balanceMist: balance,
+      gasReserveMist: topupReserveMist(),
+    });
+    status = decideStatus(settings, budget);
+    reasons.push({
+      reason: status === "needs_raise" ? "would_create_needs_raise" : `would_create_${status}`,
+      source: "database",
+      within_budget: budget.within_budget,
+      shortfall_sui: formatMist(BigInt(budget.shortfall_mist)),
+    });
+  }
+
+  return {
+    agent_id: agentId,
+    capability_key: capabilityKey,
+    ...(catalog ? { catalog_id: catalog.id, cost_sui: formatMist(BigInt(catalog.price_mist)) } : {}),
+    would_propose: wouldPropose,
+    would_create_status: status,
+    ...(budget ? { budget } : {}),
+    reasons,
+    decision_basis: decisionBasis,
+    ...(decisionBasisNote ? { decision_basis_note: decisionBasisNote } : {}),
   };
 }
 
@@ -342,6 +531,16 @@ export async function executeRequest({ requestId }) {
     })();
     enqueueMemory(memoryId);
 
+    if (request.capability_key === PREMIUM_CAPABILITY_KEY) {
+      let verified = false;
+      try {
+        verified = (await verifyReceipt({ id: request.agent_id }, spend.digest)).ok;
+      } catch {
+        verified = false;
+      }
+      if (!verified) db.prepare("UPDATE agent_capabilities SET note='receipt_unverified' WHERE request_id=?").run(requestId);
+    }
+
     return publicRequest(db.prepare("SELECT * FROM upgrade_requests WHERE id=?").get(requestId));
   });
 }
@@ -445,13 +644,22 @@ export async function guidanceForAgent(agentId) {
   const pending = db.prepare("SELECT COUNT(*) AS count FROM upgrade_requests WHERE agent_id=? AND status IN ('pending_approval','needs_raise','approved')").get(agentId).count;
 
   let lessons = [];
+  let lessonsRecall = { ok: false, error: "not requested" };
   try {
-    const recalled = await recallForAgent(agentId, "upgrade purchased upgrade rejected review lessons", 10);
-    lessons = recalled
-      .filter((entry) => /\| upgrade_purchased \||\| upgrade_rejected \||\| review \|/.test(String(entry.text)))
-      .slice(0, 5);
-  } catch {
-    lessons = [];
+    const recalled = await recallLessons(agentId, { force: false });
+    lessonsRecall = recalled.ok ? { ok: true } : { ok: false, error: recalled.error };
+    if (recalled.ok) {
+      lessons = lessonsForAgent(agentId).slice(0, 5).map((lesson) => ({
+        kind: lesson.kind,
+        capability_key: lesson.capability_key,
+        task_category: lesson.task_category,
+        verdict: lesson.verdict,
+        text_excerpt: String(lesson.detail ?? lesson.source_text ?? "").slice(0, 160),
+        blob_id: lesson.blob_id,
+      }));
+    }
+  } catch (error) {
+    lessonsRecall = { ok: false, error: safeText(error) };
   }
 
   return {
@@ -469,6 +677,8 @@ export async function guidanceForAgent(agentId) {
       balance_mist: balance,
     },
     pending_requests: pending,
+    premium_pass: passStatus(agentId),
     lessons,
+    lessons_recall: lessonsRecall,
   };
 }

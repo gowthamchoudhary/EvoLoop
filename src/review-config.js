@@ -37,6 +37,19 @@ export const PROPOSAL_COOLDOWN_MINUTES = 30;
 // follow-up spend can cover its own transfer gas.
 export const UPGRADE_TOPUP_GAS_MARGIN_MIST = "10000000";
 
+// Block 3c-2 upgrade verdicts.
+
+// An upgrade is judged only once its capability has produced at least this many outcomes.
+export const MIN_AFTER_OUTCOMES = 5;
+// baseline_rate - after_rate at or above this: the upgrade paid off.
+export const WORTH_IT_DROP = 0.2;
+// baseline_rate - after_rate at or below this: the upgrade did not help.
+export const NOT_WORTH_DROP = 0.05;
+// A not_worth_it verdict blocks re-proposing the same capability for this long.
+export const VERDICT_COOLDOWN_DAYS = 30;
+// Compressed-period agents use minutes instead of days.
+export const VERDICT_COOLDOWN_MINUTES_COMPRESSED = 120;
+
 // Seeded by `npm run catalog:seed`. Prices are integer MIST strings; vendor ids are resolved
 // from the vendors table by label so the catalog always points at real vendor wallets.
 export const UPGRADE_CATALOG = [

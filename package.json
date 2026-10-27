@@ -16,6 +16,9 @@
     "smoke:block2": "node scripts/smoke-block2.js",
     "smoke:block3": "node scripts/smoke-block3.js",
     "smoke:block3b": "node scripts/smoke-block3b.js",
+    "smoke:block3c1": "node scripts/smoke-block3c1.js",
+    "demo:cycle": "node scripts/demo-cycle.js",
+    "demo:portable": "node scripts/demo-portable.js",
     "debug:transfer": "node scripts/debug-transfer.js",
     "debug:confirm": "node scripts/debug-confirm.js",
     "verify:smoke": "node scripts/verify-last-smoke.js"

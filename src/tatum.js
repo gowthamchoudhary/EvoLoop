@@ -231,6 +231,56 @@ export async function tatumHttpJsonRpc(options) {
   return response.payload;
 }
 
+const RATES_URL = "https://api.tatum.io/v4/data/rate/symbol";
+const RATE_TTL_MS = 20_000;
+const rateCache = new Map();
+
+/**
+ * Current exchange rate for one symbol against a base pair, through the same queue, retry policy
+ * and activity log as the gRPC calls (method name `rest:GET /v4/data/rate/symbol`).
+ * Each pair is cached for RATE_TTL_MS seconds.
+ */
+export async function getRate(symbol, basePair) {
+  const symbolKey = String(symbol ?? "").trim().toUpperCase();
+  const pairKey = String(basePair ?? "").trim().toUpperCase();
+  const cacheKey = `${symbolKey}/${pairKey}`;
+  const cached = rateCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.value;
+
+  const config = getConfig();
+  const url = `${RATES_URL}?symbol=${encodeURIComponent(symbolKey)}&basePair=${encodeURIComponent(pairKey)}`;
+  const response = await enqueue("rest:GET /v4/data/rate/symbol", async () => {
+    const result = await fetch(url, {
+      method: "GET",
+      headers: { "x-api-key": config.TATUM_API_KEY, Accept: "application/json" },
+    });
+    const body = await result.text();
+    if (result.status === 429 || result.status === 503) {
+      const error = new Error(`HTTP ${result.status}: ${body}`);
+      error.code = result.status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE";
+      error.retryAfter = result.headers.get("retry-after");
+      throw error;
+    }
+    return { [HTTP_RESPONSE]: true, response: { status: result.status, ok: result.ok, body } };
+  });
+
+  if (!response.ok) throw new Error(`Tatum rates request failed: HTTP ${response.status} ${cleanMessage(response.body ?? "").slice(0, 300)}`);
+  let payload;
+  try { payload = JSON.parse(response.body); } catch { throw new Error("Tatum rates returned a non-JSON body"); }
+  const value = Number(payload?.value);
+  if (!Number.isFinite(value)) throw new Error(`Tatum rates returned no usable value for ${cleanMessage(cacheKey)}`);
+
+  const rate = {
+    symbol: payload.symbol ?? symbolKey,
+    basePair: payload.basePair ?? pairKey,
+    value,
+    timestamp: typeof payload.timestamp === "number" ? payload.timestamp : null,
+    source: "tatum-rates",
+  };
+  rateCache.set(cacheKey, { value: rate, expiresAt: Date.now() + RATE_TTL_MS });
+  return rate;
+}
+
 export function closeTatum() {
   transport?.close();
   transport = undefined;
