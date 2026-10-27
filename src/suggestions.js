@@ -8,12 +8,12 @@ export function publicSuggestion(row){if(!row)return null;return {...row,reasons
 export function createSuggestion(score){
   if(score.status!=="scored")return null;
   const db=getDatabase(), prev=db.prepare("SELECT * FROM agent_scores WHERE agent_id=? AND status='scored' AND id<>? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(score.agent_id,score.id);
-  const history=db.prepare("SELECT score FROM agent_scores WHERE agent_id=? AND status='scored' ORDER BY created_at DESC,rowid DESC LIMIT ?").all(score.agent_id,PROBATION_CONSECUTIVE);
+  const history=db.prepare("SELECT score FROM agent_scores WHERE agent_id=? AND status='scored' AND id<>? ORDER BY created_at DESC,rowid DESC LIMIT ?").all(score.agent_id,score.id,PROBATION_CONSECUTIVE-1);
   const priorCount=db.prepare("SELECT COUNT(*) AS n FROM agent_scores WHERE agent_id=? AND status='scored' AND id<>?").get(score.agent_id,score.id).n;
   const current=BigInt(score.allowance_mist||"0"); let kind="hold", reason;
   if(score.score>=RAISE_SCORE && prev && score.score-prev.score>=RAISE_IMPROVEMENT && score.worth_it_verdicts>0){kind="raise";reason=`score ${score.score} >= ${RAISE_SCORE}; improvement ${Math.round((score.score-prev.score)*10)/10} >= ${RAISE_IMPROVEMENT}; worth_it verdicts ${score.worth_it_verdicts}`;}
-  else if(history.length===PROBATION_CONSECUTIVE && history.every(x=>x.score<PROBATION_SCORE)){kind="probation";reason=`${PROBATION_CONSECUTIVE} consecutive scores below ${PROBATION_SCORE}: ${history.map(x=>x.score).reverse().join(", ")}`;}
-  else reason=priorCount===0?"only one scored period":score.score<RAISE_SCORE?`score below raise threshold ${RAISE_SCORE}`:history.length===1&&history[0].score<PROBATION_SCORE?"one weak period is not probation":!prev?"no previous scored period":"raise improvement or worth_it requirement not met";
+  else if(score.score<PROBATION_SCORE&&history.length===PROBATION_CONSECUTIVE-1&&history.every(x=>x.score<PROBATION_SCORE)){kind="probation";reason=`${PROBATION_CONSECUTIVE} consecutive scores below ${PROBATION_SCORE}: ${[...history.map(x=>x.score).reverse(),score.score].join(", ")}`;}
+  else reason=score.score<PROBATION_SCORE&&history.filter(x=>x.score<PROBATION_SCORE).length<PROBATION_CONSECUTIVE-1?`not probation: not enough consecutive weak periods (need ${PROBATION_CONSECUTIVE})`:priorCount===0?"only one scored period":score.score<RAISE_SCORE?`score below raise threshold ${RAISE_SCORE}`:!prev?"no previous scored period":"raise improvement or worth_it requirement not met";
   const suggested=kind==="raise"?current*(100n+BigInt(RAISE_PCT))/100n:kind==="probation"?current*(100n-BigInt(PROBATION_PCT))/100n:current;
   const id=`suggest_${randomUUID()}`, now=new Date().toISOString();
   db.prepare("UPDATE salary_suggestions SET status='superseded' WHERE agent_id=? AND status='pending'").run(score.agent_id);
