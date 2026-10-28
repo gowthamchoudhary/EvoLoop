@@ -18,6 +18,8 @@
     "smoke:block3b": "node scripts/smoke-block3b.js",
     "smoke:block3c1": "node scripts/smoke-block3c1.js",
     "score:replay": "node scripts/score-replay.js",
+    "demo:publish": "node scripts/demo-publish.js",
+    "smoke:public": "node scripts/smoke-public.js",
     "demo:cycle": "node scripts/demo-cycle.js",
     "demo:portable": "node scripts/demo-portable.js",
     "debug:transfer": "node scripts/debug-transfer.js",
@@ -25,6 +27,8 @@
     "verify:smoke": "node scripts/verify-last-smoke.js"
   },
   "dependencies": {
+    "@fastify/rate-limit": "^11.2.1",
+    "@fastify/static": "^10.1.8",
     "@grpc/grpc-js": "^1.14.6",
     "@mysten-incubation/memwal": "^0.1.7",
     "@mysten/sui": "^2.37.0",
