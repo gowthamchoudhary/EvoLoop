@@ -22,6 +22,7 @@ function methodName(method) {
 }
 
 function record(entry) {
+  if (!entry.at) entry.at = new Date().toISOString();
   activity.push(entry);
   if (activity.length > 200) activity.splice(0, activity.length - 200);
 }

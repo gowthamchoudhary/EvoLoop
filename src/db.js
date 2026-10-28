@@ -20,7 +20,9 @@ export function initDatabase() {
       description TEXT NOT NULL,
       api_key_hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active'
+      status TEXT NOT NULL DEFAULT 'active',
+      public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1)),
+      demo_actionable INTEGER NOT NULL DEFAULT 0 CHECK(demo_actionable IN (0,1))
     );
     CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY,
@@ -333,7 +335,16 @@ export function initDatabase() {
       UNIQUE(agent_id, source_text)
     );
     CREATE INDEX IF NOT EXISTS lessons_agent_kind ON lessons(agent_id, kind);
+    CREATE TABLE IF NOT EXISTS demo_actions (
+      id TEXT PRIMARY KEY, ip_hash TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('approve','reject')),
+      request_id TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS demo_actions_created ON demo_actions(created_at);
+    CREATE INDEX IF NOT EXISTS demo_actions_ip_created ON demo_actions(ip_hash,created_at);
   `);
+  const agentColumns=database.prepare("PRAGMA table_info(agents)").all().map(column=>column.name);
+  if(!agentColumns.includes("public"))database.exec("ALTER TABLE agents ADD COLUMN public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1))");
+  if(!agentColumns.includes("demo_actionable"))database.exec("ALTER TABLE agents ADD COLUMN demo_actionable INTEGER NOT NULL DEFAULT 0 CHECK(demo_actionable IN (0,1))");
   return database;
 }
 
