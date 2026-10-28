@@ -9,6 +9,9 @@
   "scripts": {
     "smoke": "node scripts/smoke.js",
     "dev": "node src/server.js",
+    "dashboard:install": "npm --prefix dashboard install",
+    "dashboard:build": "npm --prefix dashboard run build",
+    "dashboard:dev": "npm --prefix dashboard run dev",
     "smoke:block1": "node scripts/smoke-block1.js",
     "treasury:create": "node scripts/treasury-create.js",
     "vendors:seed": "node scripts/vendors-seed.js",
