@@ -1,6 +1,16 @@
 // Block 3a review tuning. Change these here; the review engine reads nothing else.
 
 export const MIN_OUTCOMES = 5;
+export const SCORE_WEIGHT_QUALITY = 0.6;
+export const SCORE_WEIGHT_DISCIPLINE = 0.2;
+export const SCORE_WEIGHT_UPGRADES = 0.2;
+export const SCORE_MIN_OUTCOMES = MIN_OUTCOMES;
+export const RAISE_SCORE = 80;
+export const RAISE_IMPROVEMENT = 30;
+export const PROBATION_SCORE = 50;
+export const PROBATION_CONSECUTIVE = 2;
+export const RAISE_PCT = 25;
+export const PROBATION_PCT = 25;
 export const MIN_ISSUE_RATE = 0.3;
 export const MIN_SESSIONS_WITH_ISSUES = 2;
 export const IMPACT_SATURATION = 10;

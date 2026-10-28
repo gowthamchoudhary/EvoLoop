@@ -20,7 +20,9 @@ export function initDatabase() {
       description TEXT NOT NULL,
       api_key_hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active'
+      status TEXT NOT NULL DEFAULT 'active',
+      public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1)),
+      demo_actionable INTEGER NOT NULL DEFAULT 0 CHECK(demo_actionable IN (0,1))
     );
     CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY,
@@ -241,6 +243,22 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS upgrade_verdicts_agent ON upgrade_verdicts(agent_id, evaluated_at DESC);
     CREATE INDEX IF NOT EXISTS upgrade_verdicts_request ON upgrade_verdicts(request_id);
+    CREATE TABLE IF NOT EXISTS agent_scores (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), period_label TEXT NOT NULL,
+      window_start TEXT NOT NULL, window_end TEXT NOT NULL, score REAL,
+      status TEXT NOT NULL CHECK(status IN ('scored','insufficient_data')), components_json TEXT NOT NULL,
+      outcomes INTEGER NOT NULL, issue_rate REAL, spent_mist TEXT NOT NULL, allowance_mist TEXT NOT NULL,
+      created_at TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('live','replay'))
+    );
+    CREATE INDEX IF NOT EXISTS agent_scores_agent_created ON agent_scores(agent_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS salary_suggestions (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), score_id TEXT NOT NULL REFERENCES agent_scores(id),
+      kind TEXT NOT NULL CHECK(kind IN ('raise','probation','hold')), current_allowance_mist TEXT NOT NULL,
+      suggested_allowance_mist TEXT NOT NULL, reasons_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending','accepted','dismissed','superseded')),
+      decided_note TEXT, created_at TEXT NOT NULL, decided_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS salary_suggestions_agent_created ON salary_suggestions(agent_id, created_at DESC);
   `);
   const capabilityColumns = database.prepare("PRAGMA table_info(agent_capabilities)").all().map((column) => column.name);
   if (capabilityColumns.length > 0 && !capabilityColumns.includes("note")) database.exec("ALTER TABLE agent_capabilities ADD COLUMN note TEXT");
@@ -317,7 +335,16 @@ export function initDatabase() {
       UNIQUE(agent_id, source_text)
     );
     CREATE INDEX IF NOT EXISTS lessons_agent_kind ON lessons(agent_id, kind);
+    CREATE TABLE IF NOT EXISTS demo_actions (
+      id TEXT PRIMARY KEY, ip_hash TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('approve','reject')),
+      request_id TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS demo_actions_created ON demo_actions(created_at);
+    CREATE INDEX IF NOT EXISTS demo_actions_ip_created ON demo_actions(ip_hash,created_at);
   `);
+  const agentColumns=database.prepare("PRAGMA table_info(agents)").all().map(column=>column.name);
+  if(!agentColumns.includes("public"))database.exec("ALTER TABLE agents ADD COLUMN public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1))");
+  if(!agentColumns.includes("demo_actionable"))database.exec("ALTER TABLE agents ADD COLUMN demo_actionable INTEGER NOT NULL DEFAULT 0 CHECK(demo_actionable IN (0,1))");
   return database;
 }
 

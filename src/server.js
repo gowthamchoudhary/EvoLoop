@@ -17,6 +17,14 @@ import { PREMIUM_VERIFY_POLL_MS } from "./premium-config.js";
 import { consumeCall, paymentRequired, passStatus, publicPass, recordPremiumCall, verifyReceipt } from "./premium.js";
 import { getRate, getTatumActivity } from "./tatum.js";
 import { evaluateVerdict, listVerdicts } from "./verdicts.js";
+import { computeScore, storeScore, publicScore } from "./score.js";
+import { acceptSuggestion, createSuggestion, dismissSuggestion, listSuggestions, publicSuggestion } from "./suggestions.js";
+import rateLimit from "@fastify/rate-limit";
+import fastifyStatic from "@fastify/static";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { registerPublicRoutes } from "./public-routes.js";
+import { PUBLIC_RATE_LIMIT_PER_MIN } from "./public-config.js";
 
 export const eventTypes = z.enum([
   "task_completed",
@@ -69,6 +77,7 @@ const settingsSchema = z.object({
   auto_limit_mist: z.string().trim().regex(/^\d{1,40}$/).default("0"),
   rollover: z.union([z.boolean(), z.number().int().min(0).max(1)]).default(false),
 });
+const visibilitySchema=z.object({public:z.boolean(),demo_actionable:z.boolean().default(false)});
 const approveSchema = z.object({
   note: z.string().trim().max(500).optional(),
   extra_budget_sui: z.number().positive().optional(),
@@ -95,6 +104,7 @@ const reviewRunSchema = z.object({
   period_label: z.string().trim().min(1).max(100).optional(),
   window_start: z.string().datetime({ offset: true }).optional(),
   window_end: z.string().datetime({ offset: true }).optional(),
+  score_snapshot: z.boolean().default(true),
 }).refine((value) => !value.window_start || !value.window_end || Date.parse(value.window_start) <= Date.parse(value.window_end), {
   message: "window_start must not be after window_end",
   path: ["window_start"],
@@ -155,6 +165,9 @@ export async function buildServer() {
   resumePendingMemories();
   const app = Fastify({ logger: false });
 
+  await app.register(rateLimit,{global:true,max:PUBLIC_RATE_LIMIT_PER_MIN,timeWindow:60_000,allowList:(request)=>!request.url.startsWith("/public/v1/")});
+  app.addHook("onSend",async(_request,reply,payload)=>{reply.header("X-Content-Type-Options","nosniff");reply.header("Referrer-Policy","no-referrer");reply.header("X-Frame-Options","DENY");return payload;});
+
   app.addHook("onResponse", async (request, reply) => {
     const route = request.routeOptions?.url ?? "<unmatched>";
     console.log(safeText(`${request.method} ${route} ${reply.statusCode} ${reply.elapsedTime.toFixed(1)}ms`));
@@ -174,6 +187,8 @@ export async function buildServer() {
       return reply.code(503).send({ status: "error", db: "error" });
     }
   });
+
+  app.put("/v1/agents/:id/visibility",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const parsed=visibilitySchema.safeParse(request.body);if(!parsed.success)return reply.code(400).send({error:"invalid request",issues:parsed.error.issues});const changed=getDatabase().prepare("UPDATE agents SET public=?,demo_actionable=? WHERE id=?").run(parsed.data.public?1:0,parsed.data.demo_actionable?1:0,request.params.id);if(!changed.changes)return reply.code(404).send({error:"agent not found"});return {agent_id:request.params.id,public:parsed.data.public,demo_actionable:parsed.data.demo_actionable};});
 
   app.post("/v1/agents/register", async (request, reply) => {
     const token = bearerToken(request);
@@ -319,7 +334,7 @@ export async function buildServer() {
       if (!countsByAgent.has(agent_id)) countsByAgent.set(agent_id, { pending: 0, stored: 0, failed: 0 });
       countsByAgent.get(agent_id)[status] = count;
     }
-    return agents.map((agent) => ({ ...agent, memory_counts: countsByAgent.get(agent.id) ?? { pending: 0, stored: 0, failed: 0 } }));
+    return agents.map((agent) => ({ ...agent, memory_counts: countsByAgent.get(agent.id) ?? { pending: 0, stored: 0, failed: 0 }, latest_score: publicScore(getDatabase().prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(agent.id)), pending_suggestion: publicSuggestion(getDatabase().prepare("SELECT * FROM salary_suggestions WHERE agent_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(agent.id)) }));
   });
 
   app.get("/v1/memories", async (request, reply) => {
@@ -409,8 +424,23 @@ export async function buildServer() {
       windowStart: parsed.data.window_start,
       windowEnd: parsed.data.window_end,
     });
+    if(parsed.data.score_snapshot){const scoreData=computeScore(request.params.id,result.review.window_start,result.review.window_end);const score=storeScore(scoreData,result.review.period_label);const suggestion=createSuggestion({...scoreData,...score});result.score=score;result.suggestion=suggestion;}
     return reply.code(201).send(result);
   });
+
+  const scoreWindowSchema=z.object({period_label:z.string().trim().min(1).max(100),window_start:z.string().datetime({offset:true}),window_end:z.string().datetime({offset:true})}).refine(x=>Date.parse(x.window_start)<=Date.parse(x.window_end),{path:["window_start"],message:"window_start must not be after window_end"});
+  app.post("/v1/agents/:id/score/snapshot",async(request,reply)=>{
+    if(!isAdminToken(bearerToken(request)))return authError(reply);
+    const parsed=scoreWindowSchema.safeParse(request.body);if(!parsed.success)return reply.code(400).send({error:"invalid request",issues:parsed.error.issues});
+    const db=getDatabase();if(!db.prepare("SELECT 1 FROM agents WHERE id=?").get(request.params.id))return reply.code(404).send({error:"agent not found"});
+    const computed=computeScore(request.params.id,parsed.data.window_start,parsed.data.window_end);const score=storeScore(computed,parsed.data.period_label,request.query?.source==="replay"?"replay":"live");const suggestion=createSuggestion({...computed,...score});return reply.code(201).send({score,suggestion});
+  });
+  app.get("/v1/agents/:id/scores",async(request,reply)=>{const token=bearerToken(request),admin=isAdminToken(token),agent=admin?null:agentForToken(token);if(!admin&&!agent)return authError(reply);if(!admin&&agent.id!==request.params.id)return reply.code(403).send({error:"forbidden"});return getDatabase().prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC").all(request.params.id).map(publicScore);});
+  app.get("/v1/agents/:id/score",async(request,reply)=>{const token=bearerToken(request),admin=isAdminToken(token),agent=admin?null:agentForToken(token);if(!admin&&!agent)return authError(reply);if(!admin&&agent.id!==request.params.id)return reply.code(403).send({error:"forbidden"});return publicScore(getDatabase().prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(request.params.id))??reply.code(404).send({error:"score not found"});});
+  app.get("/v1/suggestions",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const q=z.object({agent_id:z.string().min(1).optional(),status:z.enum(["pending","accepted","dismissed","superseded"]).optional()}).safeParse(request.query);if(!q.success)return reply.code(400).send({error:"invalid query",issues:q.error.issues});return listSuggestions({agentId:q.data.agent_id,status:q.data.status});});
+  const decisionSchema=z.object({note:z.string().trim().max(500).optional()});
+  app.post("/v1/suggestions/:id/accept",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const p=decisionSchema.safeParse(request.body??{});if(!p.success)return reply.code(400).send({error:"invalid request",issues:p.error.issues});const out=acceptSuggestion(request.params.id,p.data.note);return out.status?reply.code(out.status).send({error:out.error}):out;});
+  app.post("/v1/suggestions/:id/dismiss",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const p=decisionSchema.safeParse(request.body??{});if(!p.success)return reply.code(400).send({error:"invalid request",issues:p.error.issues});const out=dismissSuggestion(request.params.id,p.data.note);return out.status?reply.code(out.status).send({error:out.error}):out;});
 
   app.get("/v1/agents/:id/reviews", async (request, reply) => {
     if (!isAdminToken(bearerToken(request))) return authError(reply);
@@ -755,6 +785,16 @@ export async function buildServer() {
       saved_sui: formatMist(row.saved_mist),
     }));
   });
+
+  await registerPublicRoutes(app);
+  const dashboardRoot=resolve(process.cwd(),"dashboard/dist");
+  if(existsSync(dashboardRoot)){
+    await app.register(fastifyStatic,{root:dashboardRoot,prefix:"/",wildcard:false});
+    app.get("/*",async(request,reply)=>{const path=request.url.split("?")[0];if(path.startsWith("/v1/")||path==="/v1"||path.startsWith("/public/")||path==="/public"||path.startsWith("/health"))return reply.code(404).send({error:"not found"});return reply.type("text/html; charset=utf-8").sendFile("index.html");});
+  }else{
+    app.get("/",async()=>({name:"payroll-layer",status:"ok",docs:"see README"}));
+    app.get("/*",async(request,reply)=>reply.code(404).send({error:"not found"}));
+  }
 
   app.get("/v1/transactions/:digest/verify", async (request, reply) => {
     const token = bearerToken(request);

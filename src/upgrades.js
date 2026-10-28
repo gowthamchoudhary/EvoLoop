@@ -418,6 +418,8 @@ export async function proposeCheckForAgent({ agentId, capabilityKey }) {
 
   return {
     agent_id: agentId,
+    latest_score: (()=>{const row=db.prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(agentId);return row?{...row,components:JSON.parse(row.components_json)}:null;})(),
+    pending_suggestion: (()=>{const row=db.prepare("SELECT * FROM salary_suggestions WHERE agent_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(agentId);return row?{...row,reasons:JSON.parse(row.reasons_json)}:null;})(),
     capability_key: capabilityKey,
     ...(catalog ? { catalog_id: catalog.id, cost_sui: formatMist(BigInt(catalog.price_mist)) } : {}),
     would_propose: wouldPropose,
@@ -546,7 +548,7 @@ export async function executeRequest({ requestId }) {
 }
 
 /** Approve a pending or needs_raise request. The status claim is atomic, so only one caller pays. */
-export async function approveRequest({ requestId, note, extraBudgetSui }) {
+export async function approveRequest({ requestId, note, extraBudgetSui, decidedBy = "admin", decisionOnly = false }) {
   const db = getDatabase();
   const request = db.prepare("SELECT * FROM upgrade_requests WHERE id=?").get(requestId);
   if (!request) throw httpError(404, "request not found");
@@ -567,8 +569,8 @@ export async function approveRequest({ requestId, note, extraBudgetSui }) {
   }
 
   const decidedAt = new Date().toISOString();
-  const claim = db.prepare("UPDATE upgrade_requests SET status='approved', decided_at=?, decided_by='admin', decision_note=COALESCE(?, decision_note) WHERE id=? AND status=?")
-    .run(decidedAt, note ?? null, requestId, request.status);
+  const claim = db.prepare("UPDATE upgrade_requests SET status='approved', decided_at=?, decided_by=?, decision_note=COALESCE(?, decision_note) WHERE id=? AND status=?")
+    .run(decidedAt, decidedBy, note ?? null, requestId, request.status);
   if (claim.changes !== 1) throw httpError(409, "request is already decided", { status: request.status });
 
   if (extraMist !== null) {
@@ -586,18 +588,18 @@ export async function approveRequest({ requestId, note, extraBudgetSui }) {
     }), requestId);
   }
 
-  return executeRequest({ requestId });
+  return decisionOnly ? publicRequest(db.prepare("SELECT * FROM upgrade_requests WHERE id=?").get(requestId)) : executeRequest({ requestId });
 }
 
-export function rejectRequest({ requestId, note }) {
+export function rejectRequest({ requestId, note, decidedBy = "admin" }) {
   const db = getDatabase();
   const request = db.prepare("SELECT * FROM upgrade_requests WHERE id=?").get(requestId);
   if (!request) throw httpError(404, "request not found");
   if (!DECIDABLE_STATUSES.includes(request.status)) {
     throw httpError(409, "request is already decided", { status: request.status });
   }
-  const claim = db.prepare("UPDATE upgrade_requests SET status='rejected', decided_at=?, decided_by='admin', decision_note=? WHERE id=? AND status=?")
-    .run(new Date().toISOString(), note ?? null, requestId, request.status);
+  const claim = db.prepare("UPDATE upgrade_requests SET status='rejected', decided_at=?, decided_by=?, decision_note=? WHERE id=? AND status=?")
+    .run(new Date().toISOString(), decidedBy, note ?? null, requestId, request.status);
   if (claim.changes !== 1) throw httpError(409, "request is already decided", { status: request.status });
   queueMemory(request.agent_id, `Agent ${request.agent_id} | upgrade_rejected | ${request.capability_key ?? "none"} | ${note ?? "no note"}`);
   return publicRequest(db.prepare("SELECT * FROM upgrade_requests WHERE id=?").get(requestId));
