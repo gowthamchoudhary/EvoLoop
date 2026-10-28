@@ -80,5 +80,5 @@ await step("demo approve/reject is globally disabled while DEMO_ACTIONS_ENABLED 
   } finally { await cleanup(); }
 });
 await step("public rate limit returns at least one 429 in 80 rapid requests",async()=>{let limited=0;for(let i=0;i<80;i++){const response=await fetch(base+"/public/v1/system");if(response.status===429)limited++;}ensure(limited>0,"none of the 80 requests received HTTP 429");return `${limited} responses returned 429`;});
-await step("static root serves the dashboard placeholder",async()=>{const response=await fetch(base+"/");const html=await response.text();ensure(response.status===200&&html.includes("Payroll Layer public API")&&html.includes("/public/v1/system"),`GET / returned HTTP ${response.status} or unexpected content`);});
+await step("static root serves the dashboard placeholder or the built app",async()=>{const response=await fetch(base+"/");const html=await response.text();const isPlaceholder=html.includes("Payroll Layer public API")&&html.includes("/public/v1/system");const isBuiltApp=/<div[^>]+id=["']root["']/i.test(html)&&/<script[^>]+src=/i.test(html);ensure(response.status===200&&(isPlaceholder||isBuiltApp),`GET / returned HTTP ${response.status} or unexpected content`);});
 db.close();if(failed)process.exitCode=1;
