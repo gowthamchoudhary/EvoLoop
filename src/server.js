@@ -19,6 +19,12 @@ import { getRate, getTatumActivity } from "./tatum.js";
 import { evaluateVerdict, listVerdicts } from "./verdicts.js";
 import { computeScore, storeScore, publicScore } from "./score.js";
 import { acceptSuggestion, createSuggestion, dismissSuggestion, listSuggestions, publicSuggestion } from "./suggestions.js";
+import rateLimit from "@fastify/rate-limit";
+import fastifyStatic from "@fastify/static";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { registerPublicRoutes } from "./public-routes.js";
+import { PUBLIC_RATE_LIMIT_PER_MIN } from "./public-config.js";
 
 export const eventTypes = z.enum([
   "task_completed",
@@ -71,6 +77,7 @@ const settingsSchema = z.object({
   auto_limit_mist: z.string().trim().regex(/^\d{1,40}$/).default("0"),
   rollover: z.union([z.boolean(), z.number().int().min(0).max(1)]).default(false),
 });
+const visibilitySchema=z.object({public:z.boolean(),demo_actionable:z.boolean().default(false)});
 const approveSchema = z.object({
   note: z.string().trim().max(500).optional(),
   extra_budget_sui: z.number().positive().optional(),
@@ -158,6 +165,9 @@ export async function buildServer() {
   resumePendingMemories();
   const app = Fastify({ logger: false });
 
+  await app.register(rateLimit,{global:true,max:PUBLIC_RATE_LIMIT_PER_MIN,timeWindow:60_000,allowList:(request)=>!request.url.startsWith("/public/v1/")});
+  app.addHook("onSend",async(_request,reply,payload)=>{reply.header("X-Content-Type-Options","nosniff");reply.header("Referrer-Policy","no-referrer");reply.header("X-Frame-Options","DENY");return payload;});
+
   app.addHook("onResponse", async (request, reply) => {
     const route = request.routeOptions?.url ?? "<unmatched>";
     console.log(safeText(`${request.method} ${route} ${reply.statusCode} ${reply.elapsedTime.toFixed(1)}ms`));
@@ -177,6 +187,8 @@ export async function buildServer() {
       return reply.code(503).send({ status: "error", db: "error" });
     }
   });
+
+  app.put("/v1/agents/:id/visibility",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const parsed=visibilitySchema.safeParse(request.body);if(!parsed.success)return reply.code(400).send({error:"invalid request",issues:parsed.error.issues});const changed=getDatabase().prepare("UPDATE agents SET public=?,demo_actionable=? WHERE id=?").run(parsed.data.public?1:0,parsed.data.demo_actionable?1:0,request.params.id);if(!changed.changes)return reply.code(404).send({error:"agent not found"});return {agent_id:request.params.id,public:parsed.data.public,demo_actionable:parsed.data.demo_actionable};});
 
   app.post("/v1/agents/register", async (request, reply) => {
     const token = bearerToken(request);
@@ -773,6 +785,16 @@ export async function buildServer() {
       saved_sui: formatMist(row.saved_mist),
     }));
   });
+
+  await registerPublicRoutes(app);
+  const dashboardRoot=resolve(process.cwd(),"dashboard/dist");
+  if(existsSync(dashboardRoot)){
+    await app.register(fastifyStatic,{root:dashboardRoot,prefix:"/",wildcard:false});
+    app.get("/*",async(request,reply)=>{const path=request.url.split("?")[0];if(path.startsWith("/v1/")||path==="/v1"||path.startsWith("/public/")||path==="/public"||path.startsWith("/health"))return reply.code(404).send({error:"not found"});return reply.type("text/html; charset=utf-8").sendFile("index.html");});
+  }else{
+    app.get("/",async()=>({name:"payroll-layer",status:"ok",docs:"see README"}));
+    app.get("/*",async(request,reply)=>reply.code(404).send({error:"not found"}));
+  }
 
   app.get("/v1/transactions/:digest/verify", async (request, reply) => {
     const token = bearerToken(request);
