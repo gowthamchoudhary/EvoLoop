@@ -15,7 +15,7 @@ import { approveRequest, createProposalsForReview, getRequest, guidanceForAgent,
 import { lessonsForAgent, recallLessons, restoreLessons } from "./lessons.js";
 import { PREMIUM_VERIFY_POLL_MS } from "./premium-config.js";
 import { consumeCall, paymentRequired, passStatus, publicPass, recordPremiumCall, verifyReceipt } from "./premium.js";
-import { getRate, getTatumActivity } from "./tatum.js";
+import { getRate, getTatumActivity, pruneTatumCalls } from "./tatum.js";
 import { evaluateVerdict, listVerdicts } from "./verdicts.js";
 import { computeScore, storeScore, publicScore } from "./score.js";
 import { acceptSuggestion, createSuggestion, dismissSuggestion, listSuggestions, publicSuggestion } from "./suggestions.js";
@@ -162,6 +162,7 @@ function publicTransaction(row) {
 
 export async function buildServer() {
   initDatabase();
+  pruneTatumCalls();
   resumePendingMemories();
   const app = Fastify({ logger: false });
 
@@ -791,8 +792,16 @@ export async function buildServer() {
   if(existsSync(dashboardRoot)){
     await app.register(fastifyStatic,{root:dashboardRoot,prefix:"/",wildcard:false});
     app.get("/*",async(request,reply)=>{const path=request.url.split("?")[0];if(path.startsWith("/v1/")||path==="/v1"||path.startsWith("/public/")||path==="/public"||path.startsWith("/health"))return reply.code(404).send({error:"not found"});return reply.type("text/html; charset=utf-8").sendFile("index.html");});
-  }else{
-    app.get("/",async()=>({name:"payroll-layer",status:"ok",docs:"see README"}));
+  }else{     app.get("/",async(req,reply)=>{
+       const htmlPath = path.join(__dirname, "../dashboard/dist/index.html");
+       try {
+         const indexHtml = await fs.readFile(htmlPath, "utf8");
+         reply.type("text/html").send(indexHtml);
+       } catch (err) {
+         reply.code(404).send({error:"not found"});
+       }
+     });
+     app.get("/public/v1/docs", async () => docs);
     app.get("/*",async(request,reply)=>reply.code(404).send({error:"not found"}));
   }
 

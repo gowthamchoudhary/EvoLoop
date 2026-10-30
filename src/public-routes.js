@@ -3,7 +3,7 @@ import { getDatabase } from "./db.js";
 import { formatMist, getPayrollBalanceBreakdown } from "./payroll-chain.js";
 import { settingsFor } from "./settings.js";
 import { passStatus } from "./premium.js";
-import { getTatumActivity } from "./tatum.js";
+import { getTatumStats } from "./tatum.js";
 import { approveRequest, rejectRequest } from "./upgrades.js";
 import { DEMO_ACTIONS_ENABLED, DEMO_MAX_APPROVALS_PER_HOUR, DEMO_MAX_APPROVALS_PER_IP_PER_HOUR, EXPLORER_ACCOUNT_URL, EXPLORER_TX_URL, NETWORK_LABEL, PUBLIC_BALANCE_CACHE_SECONDS, PUBLIC_RATE_LIMIT_PER_MIN } from "./public-config.js";
 
@@ -35,7 +35,7 @@ function publicRequests(agentId){return getDatabase().prepare("SELECT id,capabil
 const limited={config:{rateLimit:{max:PUBLIC_RATE_LIMIT_PER_MIN,timeWindow:60_000}}};
 export async function registerPublicRoutes(app){
  const db=getDatabase();
- app.get("/public/v1/system",limited,async()=>{const publicIds=db.prepare("SELECT id FROM agents WHERE public=1").all().map(x=>x.id);const counts=(ids)=>{if(!ids.length)return {memories_stored:0,memories_pending:0,memories_failed:0};const marks=ids.map(()=>"?").join(",");const rows=db.prepare(`SELECT status,COUNT(*) AS n FROM memories WHERE agent_id IN (${marks}) GROUP BY status`).all(...ids);const out={memories_stored:0,memories_pending:0,memories_failed:0};for(const row of rows)if(Object.hasOwn(out,`memories_${row.status}`))out[`memories_${row.status}`]=row.n;return out;};const activity=getTatumActivity();return {network:NETWORK_LABEL,explorer:{tx:EXPLORER_TX_URL,account:EXPLORER_ACCOUNT_URL},walrus:{namespace_prefix:process.env.NAMESPACE_PREFIX?.trim()??"pl-dev",...counts(publicIds),total:counts(db.prepare("SELECT id FROM agents").all().map(x=>x.id))},tatum:{transport:"grpc",calls_logged:activity.totalCalls},demo_actions_enabled:DEMO_ACTIONS_ENABLED,generated_at:new Date().toISOString()};});
+ app.get("/public/v1/system",limited,async()=>{const publicIds=db.prepare("SELECT id FROM agents WHERE public=1").all().map(x=>x.id);const counts=(ids)=>{if(!ids.length)return {memories_stored:0,memories_pending:0,memories_failed:0};const marks=ids.map(()=>"?").join(",");const rows=db.prepare(`SELECT status,COUNT(*) AS n FROM memories WHERE agent_id IN (${marks}) GROUP BY status`).all(...ids);const out={memories_stored:0,memories_pending:0,memories_failed:0};for(const row of rows)if(Object.hasOwn(out,`memories_${row.status}`))out[`memories_${row.status}`]=row.n;return out;};const tatumStats=getTatumStats();return {network:NETWORK_LABEL,explorer:{tx:EXPLORER_TX_URL,account:EXPLORER_ACCOUNT_URL},walrus:{namespace_prefix:process.env.NAMESPACE_PREFIX?.trim()??"pl-dev",...counts(publicIds),total:counts(db.prepare("SELECT id FROM agents").all().map(x=>x.id))},tatum:{transport:"grpc",calls_logged:tatumStats.total,calls_last_24h:tatumStats.last24h,by_method:tatumStats.byMethod},demo_actions_enabled:DEMO_ACTIONS_ENABLED,generated_at:new Date().toISOString()};});
  app.get("/public/v1/agents",limited,async()=>{const rows=db.prepare("SELECT id,name,kind,description,status FROM agents WHERE public=1 ORDER BY created_at DESC").all();return Promise.all(rows.map(baseAgent));});
  app.get("/public/v1/agents/:id",limited,async(req,reply)=>{const agent=publicAgent(req.params.id);if(!agent)return reply.code(404).send({error:"not found"});const base=await baseAgent(agent),settings=settingsFor(agent.id);return {...base,settings:{improvement_reserve_pct:settings.improvement_reserve_pct,auto_limit_sui:formatMist(settings.auto_limit_mist),rollover:Boolean(settings.rollover),period_minutes:settings.period_minutes},pass_status:passStatus(agent.id),latest_salary_suggestion:suggestionsSummary(agent.id)};});
  app.get("/public/v1/agents/:id/timeline",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});const q=new URLSearchParams(req.url.split("?")[1]??"");const n=Number(q.get("limit")??50);if(!Number.isInteger(n)||n<1||n>100)return reply.code(400).send({error:"invalid limit"});return timeline(req.params.id,n,q.get("before"));});
@@ -45,8 +45,53 @@ export async function registerPublicRoutes(app){
  app.get("/public/v1/agents/:id/scores",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});return db.prepare("SELECT id,period_label,window_start,window_end,score,status,components_json,outcomes,issue_rate,created_at,source FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC").all(req.params.id).map(s=>({id:s.id,period_label:s.period_label,window_start:s.window_start,window_end:s.window_end,score:s.score,status:s.status,components:parsed(s.components_json,[]),outcomes:s.outcomes,issue_rate:s.issue_rate,created_at:s.created_at,source:s.source}));});
  app.get("/public/v1/agents/:id/suggestions",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});return db.prepare("SELECT id,score_id,kind,current_allowance_mist,suggested_allowance_mist,reasons_json,status,created_at,decided_at FROM salary_suggestions WHERE agent_id=? ORDER BY created_at DESC").all(req.params.id).map(s=>({id:s.id,score_id:s.score_id,kind:s.kind,current_allowance_sui:formatMist(s.current_allowance_mist),suggested_allowance_sui:formatMist(s.suggested_allowance_mist),reasons:parsed(s.reasons_json,[]),status:s.status,created_at:s.created_at,decided_at:s.decided_at}));});
  app.get("/public/v1/agents/:id/transactions",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});return db.prepare("SELECT kind,amount_mist,status,digest,confirmed_at,rule_result,reason FROM transactions WHERE agent_id=? ORDER BY created_at DESC").all(req.params.id).map(t=>({kind:t.kind,amount_sui:formatMist(t.amount_mist),status:t.status,digest:t.digest,explorer_url:explorerTx(t.digest),confirmed_at:t.confirmed_at,rule_result:t.rule_result,reason:t.reason}));});
- app.get("/public/v1/agents/:id/lessons",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});return db.prepare("SELECT id,kind,capability_key,task_category,verdict,detail,blob_id,recalled_at FROM lessons WHERE agent_id=? ORDER BY recalled_at DESC").all(req.params.id).map(l=>({id:l.id,kind:l.kind,capability:l.capability_key,task_category:l.task_category,verdict:l.verdict,detail:String(l.detail??"").slice(0,240),blob_id:l.blob_id,recalled_at:l.recalled_at}));});
- app.get("/public/v1/tatum/activity",limited,async(req,reply)=>{const n=Number(req.query.limit??100);if(!Number.isInteger(n)||n<1||n>200)return reply.code(400).send({error:"invalid limit"});return getTatumActivity(n).calls.map(c=>({method:c.method,transport:String(c.method).startsWith("rest:")?"rest":"grpc",latency_ms:c.latencyMs,outcome:c.outcome,retry_count:c.retryCount,at:c.at??null}));});
+ app.get("/public/v1/agents/:id/lessons",limited,async(req,reply)=>{if(!publicAgent(req.params.id))return reply.code(404).send({error:"not found"});return db.prepare("SELECT id,kind,capability_key,task_category,verdict,detail,blob_id,recalled_at FROM lessons WHERE agent_id=? ORDER BY recalled_at DESC").all(req.params.id).map(l=>({id:l.id,kind:l.kind,capability:l.capability_key,task_category:l.task_category,verdict:l.verdict,detail:String(l.detail??"").slice(0,240),blob_id:l.blob_id,recalled_at:l.recalled_at}));});  app.get("/public/v1/tatum/activity",limited,async(req,reply)=>{const n=Number(req.query.limit??100);if(!Number.isInteger(n)||n<1||n>200)return reply.code(400).send({error:"invalid limit"});return db.prepare("SELECT method,transport,latency_ms,outcome,retry_count,at FROM tatum_calls ORDER BY at DESC,id DESC LIMIT ?").all(n);});
+
+  // Block 5b monthly public purchases snapshot.
+  app.get("/public/purchases.sql",limited,async(req,reply)=>{
+    const period = req.query.period;
+    if (period && !/^\d{4}-\d{2}$/.test(period)) {
+      return reply.code(400).send({ error: "invalid period" });
+    }
+    const rows = db.prepare(`
+      SELECT
+        a.name AS agent,
+        py.year_month,
+        r.id AS request_id,
+        r.capability_key,
+        r.cost_mist,
+        r.status,
+        r.created_at,
+        r.executed_at,
+        u.sui_tx_digest,
+        u.executed_at AS purchase_executed_at,
+        c.vendor_label,
+        c.capability_key AS product_key,
+        c.price_mist AS product_price_mist,
+        c.description AS product_description
+      FROM upgrade_transactions u
+      JOIN agents a ON a.id = u.agent_id
+      LEFT JOIN upgrade_requests r ON r.id = u.request_id
+      LEFT JOIN upgrade_catalog c ON c.id = u.catalog_id
+      LEFT JOIN year_months py ON py.id = u.year_month_id
+      WHERE u.status = 'executed'
+        AND (period IS NULL OR py.year_month = period)
+      ORDER BY u.executed_at DESC
+    `).all(period);
+    return rows.map(row => ({
+      agent: row.agent,
+      period: row.year_month,
+      request_id: row.request_id,
+      capability_key: row.capability_key,
+      cost_sui: formatMist(row.cost_mist),
+      status: row.status,
+      created_at: row.created_at,
+      executed_at: row.executed_at,
+      sui_tx_digest: row.sui_tx_digest,
+      purchase_executed_at: row.purchase_executed_at,
+      vendor_label: row.vendor_label,
+    }));
+  });
  const demo=(action)=>async(req,reply)=>{const request=db.prepare("SELECT r.id,r.agent_id,r.status FROM upgrade_requests r WHERE r.id=?").get(req.params.id);if(!request)return reply.code(404).send({error:"not found"});const agent=db.prepare("SELECT public,demo_actionable FROM agents WHERE id=?").get(request.agent_id);if(!agent?.public)return reply.code(404).send({error:"not found"});if(!DEMO_ACTIONS_ENABLED)return reply.code(403).send(status("demo_actions_disabled"));if(!agent.demo_actionable)return reply.code(403).send(status("agent_not_actionable"));if(NETWORK_LABEL!=="testnet")return reply.code(403).send(status("mainnet_not_allowed"));if(!["pending_approval","needs_raise"].includes(request.status))return reply.code(403).send(status("request_not_pending"));const ipHash=createHash("sha256").update(ipSalt).update(req.ip??"unknown").digest("hex"),since=new Date(Date.now()-hour).toISOString();const usage=db.prepare("SELECT COUNT(*) AS n FROM demo_actions WHERE created_at>=?").get(since).n,byIp=db.prepare("SELECT COUNT(*) AS n FROM demo_actions WHERE ip_hash=? AND created_at>=?").get(ipHash,since).n;if(usage>=DEMO_MAX_APPROVALS_PER_HOUR||byIp>=DEMO_MAX_APPROVALS_PER_IP_PER_HOUR)return reply.code(429).send(status("demo_action_rate_limited"));const id=`demo_${randomUUID()}`,now=new Date().toISOString();db.prepare("INSERT INTO demo_actions(id,ip_hash,action,request_id,created_at) VALUES(?,?,?,?,?)").run(id,ipHash,action,request.id,now);try{const result=action==="approve"?await approveRequest({requestId:request.id,note:req.body?.note,extraBudgetSui:req.body?.extra_budget_sui,decidedBy:"demo-manager",decisionOnly:true}):rejectRequest({requestId:request.id,note:req.body?.note,decidedBy:"demo-manager"});return {id:result.id,status:result.status,capability:result.capability_key,cost_sui:result.cost_sui,expected_benefit:result.expected_benefit,decided_at:result.decided_at,decided_by:result.decided_by};}catch(error){const code=error?.statusCode??500;return reply.code(code).send({error:code===409?"request_not_pending":"demo_action_failed",code:code===409?"request_not_pending":"demo_action_failed"});}};
  app.post("/public/v1/requests/:id/approve",limited,demo("approve"));app.post("/public/v1/requests/:id/reject",limited,demo("reject"));
 }

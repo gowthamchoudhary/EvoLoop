@@ -2,6 +2,7 @@ import { ChannelCredentials } from "@grpc/grpc-js";
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
 import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { getConfig } from "./config.js";
+import { getDatabase } from "./db.js";
 
 const MIN_START_INTERVAL_MS = 450;
 const MAX_RETRIES = 4;
@@ -17,6 +18,43 @@ let total429Retries = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/* Persisted activity: rows land in SQLite in small batches; the in-memory ring stays. */
+let pendingRows = [];
+let flushTimer = null;
+
+function transportName(method) {
+  return method.startsWith("rest:") ? "rest" : "grpc";
+}
+
+function flushPendingRows() {
+  flushTimer = null;
+  const rows = pendingRows.splice(0);
+  if (!rows.length) return;
+  try {
+    const db = getDatabase();
+    const insert = db.prepare("INSERT INTO tatum_calls(method,transport,latency_ms,outcome,retry_count,at) VALUES(?,?,?,?,?,?)");
+    const batch = db.transaction((entries) => {
+      for (const entry of entries) insert.run(entry.method, entry.transport, entry.latency_ms, entry.outcome, entry.retry_count, entry.at);
+    });
+    batch(rows);
+  } catch {
+    /* database not initialized (standalone script use) - the in-memory ring keeps the entry */
+  }
+}
+
+function persist(entry) {
+  pendingRows.push({
+    method: entry.method,
+    transport: transportName(entry.method),
+    latency_ms: entry.latencyMs,
+    outcome: entry.outcome,
+    retry_count: entry.retryCount,
+    at: entry.at,
+  });
+  if (!flushTimer) flushTimer = setTimeout(flushPendingRows, 500);
+  flushTimer.unref?.();
+}
+
 function methodName(method) {
   return `${method.service.typeName}/${method.name}`;
 }
@@ -25,6 +63,7 @@ function record(entry) {
   if (!entry.at) entry.at = new Date().toISOString();
   activity.push(entry);
   if (activity.length > 200) activity.splice(0, activity.length - 200);
+  try { persist(entry); } catch {}
 }
 
 function retryAfterMs(error) {
@@ -202,6 +241,35 @@ export function getTatumActivity(limit = 200) {
     retries429: total429Retries,
     calls: activity.slice(-boundedLimit).map((entry) => ({ ...entry })),
   };
+}
+
+/**
+ * Persisted totals for /public/v1/system: every recorded call since rows have been stored.
+ * Returns zeroed stats when the database is not initialized.
+ */
+export function getTatumStats() {
+  try {
+    const db = getDatabase();
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const total = db.prepare("SELECT COUNT(*) AS n FROM tatum_calls").get().n;
+    const last24h = db.prepare("SELECT COUNT(*) AS n FROM tatum_calls WHERE at>=?").get(since).n;
+    const byMethod = Object.fromEntries(
+      db.prepare("SELECT method, COUNT(*) AS n FROM tatum_calls GROUP BY method ORDER BY n DESC").all().map((row) => [row.method, row.n]),
+    );
+    return { total, last24h, byMethod };
+  } catch {
+    return { total: 0, last24h: 0, byMethod: {} };
+  }
+}
+
+/** Removes activity rows older than 14 days; called once when the server boots. */
+export function pruneTatumCalls() {
+  try {
+    const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    getDatabase().prepare("DELETE FROM tatum_calls WHERE at<?").run(cutoff);
+  } catch {
+    /* database not initialized */
+  }
 }
 
 export async function tatumHttpRequest({ url, apiKey, method, params }) {
