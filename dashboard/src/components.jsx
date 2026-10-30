@@ -1,6 +1,12 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
-import { short, fmtClock, explorerTx, explorerAccount } from "./api.js";
+import { NavLink, Link } from "react-router-dom";
+import { short, fmtClock, explorerTx, explorerAccount, POLL_INTERVAL } from "./api.js";
+
+const NAV_ITEMS = [
+  { to: "/dashboard", label: "Overview", icon: "◧" },
+  { to: "/how-it-works", label: "How it works", icon: "↻" },
+  { to: "/tatum", label: "Tatum activity", icon: "⌁" },
+];
 
 export function Pill({ tone = "default", title, children }) {
   return (
@@ -103,52 +109,60 @@ export function LastUpdated({ state, label = "Public API" }) {
   );
 }
 
-export function TopBar({ system }) {
+/**
+ * App shell sidebar (reference style: fixed dark app column with icon nav and a status card).
+ * The live system pills/last-updated live in the bottom status card.
+ */
+export function Sidebar({ system }) {
   const data = system?.data;
   const network = data?.network;
-  const netTone = network === "mainnet" ? "ok" : network === "testnet" ? "warn" : "default";
-  const walrusStored = data?.walrus?.total?.memories_stored;
-  const tatumCalls = data?.tatum?.calls_logged;
   return (
-    <header className="topbar">
-      <Link to="/" className="brand" title="Overview">
-        <span className="brand-name">EvoLoop</span>
+    <aside className="sidebar">
+      <Link to="/dashboard" className="brand" title="EvoLoop overview">
+        <span className="brand-name">✦ EvoLoop</span>
         <span className="brand-tag">Payroll and growth layer for AI agents</span>
       </Link>
-      <div className="topbar-pills">
-        <Pill tone={netTone} title={network ? `Sui ${network}` : "loading network"}>
-          {network ? network.toUpperCase() : "…"}
-        </Pill>
-        <Pill tone="default" title="These memory texts were written to Walrus Memory. On mainnet they are paid stored blobs; this testnet demo writes to the dev namespace.">
-          Walrus memories stored: {typeof walrusStored === "number" ? walrusStored : "…"}
-        </Pill>
-        <Pill tone="default" title={`Calls logged by the Tatum client (transport: ${data?.tatum?.transport ?? "…"})`}>
-          Tatum calls: {typeof tatumCalls === "number" ? tatumCalls : "…"}
-        </Pill>
-        <Pill tone={data?.demo_actions_enabled ? "ok" : "default"} title="Whether public visitors may exercise demo approve/reject actions">
-          demo actions: {data ? (data.demo_actions_enabled ? "on" : "off") : "…"}
-        </Pill>
+      <nav className="side-nav">
+        {NAV_ITEMS.map((item) => (
+          <NavLink key={item.to} to={item.to} className={({ isActive }) => `side-link ${isActive ? "active" : ""}`}>
+            <span className="side-icon" aria-hidden="true">{item.icon}</span>
+            {item.label}
+          </NavLink>
+        ))}
+      </nav>
+      <div className="side-card">
+        <div className="side-card-row">
+          <span className="muted small-text">network</span>
+          <Pill tone={network === "mainnet" ? "ok" : "warn"}>{network ? network.toUpperCase() : "…"}</Pill>
+        </div>
+        <div className="side-card-row">
+          <span className="muted small-text" title="These memory texts were written to Walrus Memory. On mainnet they are paid stored blobs; this testnet demo writes to the dev namespace.">
+            Walrus memories
+          </span>
+          <strong>{typeof data?.walrus?.total?.memories_stored === "number" ? data.walrus.total.memories_stored : "…"}</strong>
+        </div>
+        <div className="side-card-row">
+          <span className="muted small-text" title={`Calls logged by the Tatum client (transport: ${data?.tatum?.transport ?? "…"}), persisted server-side`}>
+            Tatum calls
+          </span>
+          <strong>{typeof data?.tatum?.calls_logged === "number" ? data.tatum.calls_logged : "…"}</strong>
+        </div>
+        <div className="side-card-row">
+          <span className="muted small-text">demo actions</span>
+          <Pill tone={data?.demo_actions_enabled ? "ok" : "default"}>{data ? (data.demo_actions_enabled ? "on" : "off") : "…"}</Pill>
+        </div>
+        <LastUpdated state={system} label="Public API" />
       </div>
-      <LastUpdated state={system} />
-    </header>
+      <div className="side-foot muted small-text">
+        <a href="https://github.com/gowthamchoudhary/EvoLoop" target="_blank" rel="noreferrer">github.com/gowthamchoudhary/EvoLoop</a>
+        <span>memories via Walrus · payments via Tatum · build {__BUILD_TIME__}</span>
+      </div>
+    </aside>
   );
 }
 
 export function Footer() {
-  return (
-    <footer className="footer">
-      <div className="footer-row">
-        <span>EvoLoop — payroll and growth layer for AI agents</span>
-        <a href="https://github.com/gowthamchoudhary/EvoLoop" target="_blank" rel="noreferrer">
-          github.com/gowthamchoudhary/EvoLoop
-        </a>
-      </div>
-      <div className="footer-row muted">
-        <span>Memories written via Walrus · rates and payments via Tatum</span>
-        <span>build {__BUILD_TIME__}</span>
-      </div>
-    </footer>
-  );
+  return null;
 }
 
 export function TypeBadge({ tone, children }) {

@@ -65,13 +65,6 @@ export default function Overview({ system }) {
   const rows = agents.data ?? [];
   return (
     <section className="page-section">
-      <div className="hero">
-        <h1>The closed loop</h1>
-        <p className="hero-line">Agents get a salary, remember what they did, ask for upgrades with evidence, and prove the upgrades worked.</p>
-        <p className="hero-note muted">
-          Everything on this page is read live from the EvoLoop server — real Walrus memories and real Tatum-ledger data. Mint amounts are shown in SUI; no fiat conversion is applied.
-        </p>
-      </div>
       <div className="section-head">
         <h2>Published agents</h2>
         <LastUpdated state={agents} label="Agent list" />
@@ -81,8 +74,9 @@ export default function Overview({ system }) {
           <div className="state-box">
             <p>
               No public agents yet. Agents appear here only after an admin publishes them (demo actions pipeline or the visibility API), so this page is intentionally
-              quiet until then.
+              quiet until then. The landing page explains the loop meanwhile.
             </p>
+            <Link to="/" className="btn ghost">← Read how it works</Link>
             <LastUpdated state={agents} label="Agent list" />
           </div>
         ) : (

@@ -341,6 +341,17 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS demo_actions_created ON demo_actions(created_at);
     CREATE INDEX IF NOT EXISTS demo_actions_ip_created ON demo_actions(ip_hash,created_at);
+    CREATE TABLE IF NOT EXISTS tatum_calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      method TEXT NOT NULL,
+      transport TEXT NOT NULL,
+      latency_ms INTEGER NOT NULL,
+      outcome TEXT NOT NULL,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tatum_calls_at ON tatum_calls(at DESC);
+    CREATE INDEX IF NOT EXISTS tatum_calls_method ON tatum_calls(method);
   `);
   const agentColumns=database.prepare("PRAGMA table_info(agents)").all().map(column=>column.name);
   if(!agentColumns.includes("public"))database.exec("ALTER TABLE agents ADD COLUMN public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1))");

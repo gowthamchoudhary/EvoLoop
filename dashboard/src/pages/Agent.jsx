@@ -1,12 +1,20 @@
-import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import { useEffect, useRef, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, LineChart, Line } from "recharts";
 import {
   fetchAgent,
   fetchTimeline,
   fetchScores,
   fetchSuggestions,
+  fetchReviews,
+  fetchRequests,
+  fetchVerdicts,
+  fetchTransactions,
+  fetchLessons,
   usePoll,
+  parseMemory,
+  memoryBadge,
+  gateReasonSentence,
   sui,
   mistSui,
   short,
@@ -17,6 +25,7 @@ import {
   fmtWhen,
   fmtClock,
   fmtPct,
+  demoAction,
 } from "../api.js";
 import { CopyChip, Gauge, LoadState, LastUpdated, Pill, TypeBadge } from "../components.jsx";
 
@@ -34,26 +43,50 @@ function badgeFor(item) {
       default: return [item.event_type ?? "event", "info"];
     }
   }
-  const kind = item.kind ?? "";
-  if (kind.startsWith("upgrade_verdict")) return ["verdict", "accent"];
-  if (kind.startsWith("upgrade")) return ["upgrade", "accent"];
-  if (kind.includes("review")) return ["review", "accent"];
-  return ["memory", "info"];
+  return memoryBadge(parseMemory(item.text));
 }
 
 const FILTERS = ["all", "events", "memories", "issues"];
 
-function TimelineTab({ agentId, system }) {
+const REQUEST_BADGES = {
+  pending_approval: ["pending approval", "warn"],
+  approved: ["approved", "ok"],
+  auto_approved: ["auto approved", "ok"],
+  needs_raise: ["needs a raise", "warn"],
+  rejected: ["rejected", "bad"],
+  executed: ["executed", "ok"],
+};
+
+function approveCodeMessage(code) {
+  const messages = {
+    demo_actions_disabled: "Demo actions are globally disabled on this server — nothing was changed.",
+    agent_not_actionable: "This agent is published but marked not actionable in the demo — nothing was changed.",
+    mainnet_not_allowed: "Demo actions are restricted to testnet — nothing was changed.",
+    request_not_pending: "This request is no longer pending.",
+    demo_action_rate_limited: "Too many demo actions from this viewer, try again later (HTTP 429).",
+    demo_action_failed: "The server could not complete the demo action.",
+  };
+  return messages[code] ?? code;
+}
+
+function TimelineTab({ agentId, system, highlightIds }) {
   const first = usePoll(() => fetchTimeline(agentId, { limit: 50 }), {}, [agentId]);
   const [extraPages, setExtraPages] = useState([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreError, setMoreError] = useState(null);
   const [filter, setFilter] = useState("all");
+  const rowRefs = useRef(new Map());
 
   useEffect(() => {
     setExtraPages([]);
     setMoreError(null);
   }, [agentId]);
+
+  useEffect(() => {
+    if (!highlightIds?.length || !first.data) return;
+    const node = rowRefs.current.get(highlightIds[0]);
+    if (node) node.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [first.data, highlightIds]);
 
   const cursor = extraPages.length ? extraPages[extraPages.length - 1].next_before : first.data?.next_before ?? null;
 
@@ -105,8 +138,15 @@ function TimelineTab({ agentId, system }) {
               const [label, tone] = badgeFor(item);
               const automated = item.type === "event" && item.details?.source === "automated_grader";
               const when = item.type === "event" ? item.ts : item.created_at;
+              const highlighted = highlightIds?.includes(item.id);
+              const memory = item.type === "memory" ? parseMemory(item.text) : null;
+              const memBadge = item.type === "memory" ? memoryBadge(memory) : null;
               return (
-                <li key={item.id} className={`tl-row ${item.type}`}>
+                <li
+                  key={item.id}
+                  className={`tl-row ${item.type} ${highlighted ? "highlight" : ""}`}
+                  ref={(node) => { if (node) rowRefs.current.set(item.id, node); else rowRefs.current.delete(item.id); }}
+                >
                   <span className="tl-time">{fmtWhen(when)}</span>
                   <span className="tl-badges">
                     <TypeBadge tone={tone}>{label}</TypeBadge>
@@ -122,11 +162,29 @@ function TimelineTab({ agentId, system }) {
                     {item.type === "event" && item.correction && <span className="tl-correction">correction: {item.correction}</span>}
                     {item.type === "memory" && (
                       <>
-                        <span className="tl-summary">{item.text}</span>
+                        {memory.known ? (
+                          <span className="tl-summary">{memory.sentence}</span>
+                        ) : (
+                          <span className="tl-summary">{item.text}</span>
+                        )}
                         <span className="tl-memory-meta">
-                          <TypeBadge tone="category">{item.kind}</TypeBadge>
+                          <TypeBadge tone={memBadge.tone}>{memBadge.label}</TypeBadge>
                           {item.blob_id && <CopyChip value={item.blob_id} note="stored in Walrus Memory" />}
                         </span>
+                        <details className="raw-memory">
+                          <summary>show raw memory text</summary>
+                          <pre>{item.text}</pre>
+                          <span className="muted small-text">
+                            {item.blob_id ? (
+                              <>blob {" "}
+                                <code>{short(item.blob_id)}</code>
+                              </>
+                            ) : (
+                              "not stored yet"
+                            )}
+                            {item.stored_at ? ` · stored ${fmtWhen(item.stored_at)}` : ` · created ${fmtWhen(item.created_at)}`}
+                          </span>
+                        </details>
                       </>
                     )}
                   </span>
@@ -159,12 +217,18 @@ function ScoreTab({ agentId, agentState }) {
   const scores = usePoll(() => fetchScores(agentId), {}, [agentId]);
   const suggestions = usePoll(() => fetchSuggestions(agentId), {}, [agentId]);
 
-  const rows = [ ...(scores.data ?? []) ].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-  const points = rows
-    .filter((row) => row.score !== null && row.score !== undefined)
-    .map((row) => ({ when: fmtClock(row.created_at) ?? row.period_label, score: row.score }));
+  const rows = [...(scores.data ?? [])].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  const points = rows.map((row) => ({
+    label: row.period_label ?? fmtClock(row.created_at),
+    score: row.score,
+    status: row.status,
+    window_start: row.window_start,
+    window_end: row.window_end,
+  }));
   const latest = rows.length ? rows[rows.length - 1] : null;
-  const suggestion = (suggestions.data ?? []).length ? [...(suggestions.data ?? [])][0] : agentState?.data?.latest_salary_suggestion ?? null;
+  const suggestionRows = [...(suggestions.data ?? [])].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  const suggestion = suggestionRows.find((row) => row.status !== "superseded") ?? null;
+  const onlySuperseded = !suggestion && suggestionRows.length > 0;
   const weightOf = (component) => (component.configured_weight ? Math.round(component.configured_weight * 100) : 0);
 
   return (
@@ -179,23 +243,33 @@ function ScoreTab({ agentId, agentState }) {
           <>
             <div className="card">
               <h4>Score history</h4>
-              {points.length > 1 ? (
-                <ResponsiveContainer width="100%" height={220}>
-                  <LineChart data={points} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
-                    <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-                    <XAxis dataKey="when" tick={{ fill: "var(--muted)", fontSize: 11 }} />
-                    <YAxis domain={[0, 100]} tick={{ fill: "var(--muted)", fontSize: 11 }} width={28} />
-                    <Tooltip contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
-                    <Line dataKey="score" stroke="var(--accent)" dot={{ r: 2 }} strokeWidth={2} isAnimationActive={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="muted small-text">One snapshot so far — the chart draws a line once there is a second point.</p>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={points} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
+                  <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 11 }} />
+                  <YAxis domain={[0, 100]} tick={{ fill: "var(--muted)", fontSize: 11 }} width={28} />
+                  <Tooltip
+                    contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+                    formatter={(value, name, item) => [value, name]}
+                    labelFormatter={(label, payload) => {
+                      const row = payload?.[0]?.payload;
+                      if (!row) return label;
+                      return `${label} · ${row.status} · window ${fmtClock(row.window_start)} → ${fmtClock(row.window_end)}`;
+                    }}
+                  />
+                  <Line dataKey="score" stroke="var(--accent)" dot={{ r: 3 }} strokeWidth={2} isAnimationActive={false} connectNulls={false} />
+                </LineChart>
+              </ResponsiveContainer>
+              {rows.length === 1 && (
+                <p className="muted small-text">Only one snapshot so far — it is drawn as a single point; the x-axis is the review period label.</p>
               )}
             </div>
             {latest && (
               <div className="card">
-                <h4>Latest snapshot {latest.period_label} <Pill tone={latest.status === "scored" ? "ok" : "warn"}>{latest.status}</Pill></h4>
+                <h4>
+                  Latest snapshot {latest.period_label} <Pill tone={latest.status === "scored" ? "ok" : "warn"}>{latest.status}</Pill>{" "}
+                  <span className="muted small-text" title={fmtWhen(latest.created_at)}>from {fmtWhen(latest.created_at)}</span>
+                </h4>
                 {latest.status === "insufficient_data" ? (
                   <p className="muted small-text">
                     Not enough data in this window to score (fewer than the minimum outcomes), so the snapshot has no number yet.
@@ -223,9 +297,6 @@ function ScoreTab({ agentId, agentState }) {
                         </td>
                       </tr>
                     ))}
-                    <tr>
-                      <td>outcomes</td><td>{latest.outcomes}</td><td>—</td><td>—</td><td>issue rate {fmtPct(latest.issue_rate)}</td>
-                    </tr>
                   </tbody>
                 </table>
                 <p className="muted small-text">Scores are computed by code from observed events; the agent does not report its own score.</p>
@@ -237,10 +308,13 @@ function ScoreTab({ agentId, agentState }) {
       <LoadState state={suggestions} what="salary suggestions">
         {suggestion ? (
           <div className="card">
-            <h4>Latest salary suggestion <Pill tone={suggestion.kind === "probation" ? "warn" : "accent"}>{SUGGESTION_LABELS[suggestion.kind] ?? suggestion.kind}</Pill></h4>
+            <h4>
+              Latest salary suggestion <Pill tone={suggestion.kind === "probation" ? "warn" : "accent"}>{SUGGESTION_LABELS[suggestion.kind] ?? suggestion.kind}</Pill>{" "}
+              <Pill tone="default">{suggestion.status}</Pill>
+            </h4>
             <p>
               {suggestion.current_allowance_sui} → <strong>{sui(suggestion.suggested_allowance_sui)}</strong>
-              {suggestion.status && <span className="muted small-text"> · {suggestion.status} · {fmtWhen(suggestion.created_at)}</span>}
+              <span className="muted small-text"> · from {fmtWhen(suggestion.created_at)}</span>
             </p>
             {(suggestion.reasons ?? []).length > 0 && (
               <ul className="reasons">
@@ -251,6 +325,8 @@ function ScoreTab({ agentId, agentState }) {
             )}
             <p className="muted small-text">Suggestions are never applied automatically — a human accepts or dismisses each one.</p>
           </div>
+        ) : onlySuperseded ? (
+          <div className="state-box"><p>All stored salary suggestions for this agent were superseded by newer ones; nothing active to show.</p></div>
         ) : (
           <div className="state-box"><p>No salary suggestions yet.</p></div>
         )}
@@ -259,18 +335,388 @@ function ScoreTab({ agentId, agentState }) {
   );
 }
 
+/* ---------------- Reviews & gaps ---------------- */
+
+const OUTCOME_LABELS = { gaps_found: ["gaps found", "warn"], no_gaps: ["no gaps", "ok"], insufficient_data: ["insufficient data", "info"] };
+const GAP_STATUS_LABELS = { passed_gate: ["passed the gate", "ok"], rejected_gate: ["rejected", "warn"], dismissed: ["dismissed", "info"], recorded: ["recorded", "info"] };
+
+function ReviewsTab({ agentId, onJumpToEvent }) {
+  const reviews = usePoll(() => fetchReviews(agentId), {}, [agentId]);
+  const list = reviews.data ?? [];
+  return (
+    <div className="tab-body">
+      <p className="tab-note muted">A problem becomes a gap only if the data passes an evidence gate. Rejected categories are shown on purpose.</p>
+      <LastUpdated state={reviews} label="Reviews" />
+      <LoadState state={reviews} what="reviews">
+        {list.length === 0 ? (
+          <div className="state-box"><p>No reviews yet. Reviews run on a window of the agent's own event history.</p></div>
+        ) : (
+          list.map((review) => {
+            const [outcomeLabel, outcomeTone] = OUTCOME_LABELS[review.outcome] ?? [review.outcome, "info"];
+            return (
+              <div className="card" key={review.id}>
+                <div className="review-head">
+                  <h4>{review.period_label}</h4>
+                  <Pill tone={outcomeTone}>{outcomeLabel}</Pill>
+                  <span className="muted small-text">{fmtWhen(review.created_at)} · window {fmtWhen(review.window_start)} → {fmtWhen(review.window_end)}</span>
+                </div>
+                {review.summary && <p className="small-text">{review.summary}</p>}
+                <table className="component-table">
+                  <thead>
+                    <tr><th>category</th><th>outcomes</th><th>issues</th><th>issue rate</th><th>sessions w/ issues</th><th>gate status</th></tr>
+                  </thead>
+                  <tbody>
+                    {review.gaps.map((gap) => {
+                      const [gapLabel, gapTone] = GAP_STATUS_LABELS[gap.status] ?? [gap.status, "info"];
+                      return (
+                        <tr key={gap.id}>
+                          <td>{gap.task_category}{gap.taxonomy ? ` (${gap.taxonomy})` : ""}</td>
+                          <td>{gap.metrics?.outcomes ?? 0}</td>
+                          <td>{gap.metrics?.issues ?? 0}</td>
+                          <td>{fmtPct(gap.metrics?.issue_rate)}</td>
+                          <td>{gap.metrics?.sessions_with_issues ?? 0}</td>
+                          <td>
+                            <Pill tone={gapTone}>{gapLabel}</Pill>
+                            <ul className="reasons">
+                              {(gap.gate_reasons ?? []).map((code, index) => (
+                                <li key={index} className="muted small-text">{gateReasonSentence(code, gap.metrics ?? {})}</li>
+                              ))}
+                            </ul>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div className="gaps-of-review">
+                  {review.gaps.filter((gap) => gap.status === "passed_gate").map((gap) => (
+                    <div className="passed-gap" key={gap.id}>
+                      <div className="passed-gap-head">
+                        <strong>{gap.task_category}</strong>
+                        <TypeBadge tone="category">{gap.taxonomy}</TypeBadge>
+                        {gap.fix_type && <TypeBadge tone="info">fix: {gap.fix_type}</TypeBadge>}
+                        <Pill tone={gap.priority_label === "high" ? "warn" : "default"}>{gap.priority_label} priority</Pill>
+                        <span className="muted small-text">
+                          severity {gap.severity} · impact {gap.impact}
+                        </span>
+                      </div>
+                      <p className="small-text">
+                        {gap.description}
+                        <TypeBadge tone={gap.description_source === "llm" ? "accent" : "category"}>
+                          {gap.description_source === "llm" ? "written by AI, numbers computed by code" : "template"}
+                        </TypeBadge>
+                      </p>
+                      {(gap.evidence_event_ids ?? []).length > 0 && (
+                        <p className="small-text">
+                          evidence:{" "}
+                          {gap.evidence_event_ids.map((eventId, index) => (
+                            <button key={index} type="button" className="icon-btn" onClick={() => onJumpToEvent(eventId)} title="jump to this event in the timeline">
+                              <code>{short(eventId)}</code>
+                            </button>
+                          ))}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                  {review.gaps.every((gap) => gap.status !== "passed_gate") && (
+                    <p className="muted small-text">No category passed the evidence gate in this review.</p>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </LoadState>
+    </div>
+  );
+}
+
+/* ---------------- Requests ---------------- */
+
+function BudgetBar({ budget, costSui }) {
+  if (!budget) return null;
+  const cap = Number(budget.improvement_cap_mist ?? 0);
+  const spent = Number(budget.improvement_spent_mist ?? 0);
+  const allowance = Number(budget.allowance_mist ?? 0);
+  const cost = Number(budget.cost_mist ?? 0);
+  const pct = (value) => (cap > 0 ? Math.min(100, (value / cap) * 100) : 0);
+  return (
+    <div className="budget-bar-wrap">
+      <div className="budget-bar">
+        <span className="budget-spent" style={{ width: `${pct(spent)}%` }} title={`spent ${mistSui(spent)}`} />
+        <span className="budget-cost" style={{ width: `${Math.min(100, pct(cost))}%` }} title={`this request ${mistSui(cost)}`} />
+      </div>
+      <div className="budget-legend muted small-text">
+        allowance {mistSui(allowance)} · improvement cap {mistSui(cap)} · spent {mistSui(spent)} · this request {costSui}
+        {budget.within_budget === false && ` · shortfall ${mistSui(budget.shortfall_mist)}`}
+      </div>
+    </div>
+  );
+}
+
+function RequestsTab({ agentId, agentState, system }) {
+  const requests = usePoll(() => fetchRequests(agentId), {}, [agentId]);
+  const [results, setResults] = useState({});
+  const [busyId, setBusyId] = useState(null);
+  const demoEnabled = system?.data?.demo_actions_enabled === true;
+
+  const run = async (requestId, action) => {
+    setBusyId(`${requestId}:${action}`);
+    const result = await demoAction(requestId, action);
+    setBusyId(null);
+    if (result.ok) {
+      setResults((prev) => ({
+        ...prev,
+        [requestId]: {
+          ok: true,
+          message: `Decision recorded: ${action === "approve" ? "approved" : "rejected"} by demo-manager. Only the decision was recorded — no payment ran from this button.`,
+        },
+      }));
+    } else {
+      setResults((prev) => ({ ...prev, [requestId]: { ok: false, message: `Action failed (HTTP ${result.statusCode}${result.code ? `, ${result.code}` : ""}): ${approveCodeMessage(result.code) ?? result.error}` } }));
+    }
+  };
+
+  const rows = requests.data ?? [];
+  return (
+    <div className="tab-body">
+      <LastUpdated state={requests} label="Requests" />
+      <LoadState state={requests} what="upgrade requests">
+        {rows.length === 0 ? (
+          <div className="state-box"><p>No upgrade requests yet. Requests appear when a review gap is turned into a proposal.</p></div>
+        ) : (
+          rows.map((row) => {
+            const [label, tone] = REQUEST_BADGES[row.status] ?? [row.status, "info"];
+            const pending = row.status === "pending_approval" || row.status === "needs_raise";
+            const result = results[row.id];
+            return (
+              <div className="card request-card" key={row.id}>
+                <div className="review-head">
+                  <h4>{row.capability}</h4>
+                  <Pill tone={tone}>{label}</Pill>
+                  <span className="muted small-text">cost {row.cost_sui} · from {fmtWhen(row.created_at)}</span>
+                </div>
+                {row.expected_benefit && <p className="small-text">{row.expected_benefit}</p>}
+                {row.baseline && (
+                  <p className="muted small-text">
+                    baseline: {row.baseline.task_category} · outcomes {row.baseline.outcomes} · issues {row.baseline.issues} · issue rate {fmtPct(row.baseline.issue_rate)}
+                    {row.baseline.priority_label ? ` · ${row.baseline.priority_label} priority` : ""}
+                  </p>
+                )}
+                <BudgetBar budget={row.budget} costSui={row.cost_sui} />
+                {(row.budget?.decision_basis ?? []).length > 0 && (
+                  <div className="decision-basis">
+                    <span className="muted small-text">Why this decision:</span>
+                    <ul className="reasons">
+                      {row.budget.decision_basis.map((item, index) => (
+                        <li key={index}>
+                          <TypeBadge tone={item.source === "walrus" ? "accent" : "category"}>{item.source}</TypeBadge>{" "}
+                          {item.kind}
+                          {item.capability_key ? ` · ${item.capability_key}` : ""}
+                          {item.text_excerpt ? ` — "${item.text_excerpt}"` : ""}
+                          {(item.blob_ids ?? []).map((blob) => <CopyChip key={blob} value={blob} note="from Walrus" />)}
+                        </li>
+                      ))}
+                    </ul>
+                    {row.budget?.decision_basis_note && <p className="muted small-text">{row.budget.decision_basis_note}</p>}
+                  </div>
+                )}
+                {row.tx_digest && (
+                  <p className="small-text">
+                    Paid on Sui <CopyChip value={row.tx_digest} explorer={row.explorer_url ?? explorerTx(system?.data, row.tx_digest)} note="confirmed via Tatum" />
+                  </p>
+                )}
+                <p className="muted small-text">
+                  decided by {row.decided_by ?? "—"}{row.decision_note ? ` · note: ${row.decision_note}` : ""}
+                  {row.decided_at ? ` · ${fmtWhen(row.decided_at)}` : ""}
+                </p>
+                {row.status === "executed" && <p className="muted small-text">payment executed {fmtWhen(row.executed_at)}</p>}
+                {pending && demoEnabled && agentState?.data && (
+                  <div className="demo-actions-row">
+                    <button type="button" className="btn" disabled={Boolean(busyId)} onClick={() => run(row.id, "approve")}>
+                      {busyId === `${row.id}:approve` ? "Approving…" : "Approve (demo manager)"}
+                    </button>
+                    <button type="button" className="btn ghost" disabled={Boolean(busyId)} onClick={() => run(row.id, "reject")}>
+                      {busyId === `${row.id}:reject` ? "Rejecting…" : "Reject (demo manager)"}
+                    </button>
+                    <span className="muted small-text">Calls the public demo endpoints; the server enforces every guard.</span>
+                  </div>
+                )}
+                {pending && !demoEnabled && <p className="muted small-text">Approvals are performed by the agent's manager.</p>}
+                {result && <p className={`demo-result ${result.ok ? "ok" : "warn"}`}>{result.message}</p>}
+              </div>
+            );
+          })
+        )}
+      </LoadState>
+    </div>
+  );
+}
+
+/* ---------------- Verdicts ---------------- */
+
+const VERDICT_BADGES = { worth_it: ["worth it", "ok"], not_worth_it: ["not worth it", "warn"], inconclusive: ["inconclusive", "info"] };
+
+function VerdictsTab({ agentId }) {
+  const verdicts = usePoll(() => fetchVerdicts(agentId), {}, [agentId]);
+  const rows = verdicts.data ?? [];
+  return (
+    <div className="tab-body">
+      <LastUpdated state={verdicts} label="Verdicts" />
+      <LoadState state={verdicts} what="verdicts">
+        {rows.length === 0 ? (
+          <div className="state-box"><p>No verdicts yet. A verdict is evaluated from events after an upgrade was unlocked.</p></div>
+        ) : (
+          rows.map((row) => {
+            const [label, tone] = VERDICT_BADGES[row.verdict] ?? [row.verdict, "info"];
+            const chart = [
+              { phase: "before", rate: Math.round((row.baseline_rate ?? 0) * 1000) / 10 },
+              { phase: "after", rate: Math.round((row.after_rate ?? 0) * 1000) / 10 },
+            ];
+            return (
+              <div className="card" key={row.id}>
+                <div className="review-head">
+                  <h4>{row.capability}</h4>
+                  <Pill tone={tone}>{label}</Pill>
+                  <span className="muted small-text">
+                    {row.baseline_outcomes} → {row.after_outcomes} outcomes · cost {row.cost_sui} · {fmtWhen(row.evaluated_at)}
+                  </span>
+                </div>
+                <ResponsiveContainer width="100%" height={160}>
+                  <BarChart data={chart} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
+                    <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="phase" tick={{ fill: "var(--muted)", fontSize: 11 }} />
+                    <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fill: "var(--muted)", fontSize: 11 }} width={40} />
+                    <Tooltip
+                      cursor={{ fill: "var(--panel-2)" }}
+                      contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+                      formatter={(value) => [`${value}% issue rate`, "issue rate"]}
+                    />
+                    <Bar dataKey="rate" fill="var(--accent)" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+                <p className="small-text">
+                  before/after: {fmtPct(row.baseline_rate)} ({row.baseline_outcomes} outcomes) → {fmtPct(row.after_rate)} ({row.after_outcomes} outcomes) · change {(row.delta >= 0 ? "+" : "")}{Math.round(row.delta * 1000) / 10} points
+                </p>
+                {row.summary && <p className="muted small-text">{row.summary}</p>}
+                <p className="muted small-text">
+                  Rule: with at least 5 outcomes after the upgrade, a drop of 20 points or more is worth it, a drop of 5 points or less is not, anything else is inconclusive.
+                </p>
+              </div>
+            );
+          })
+        )}
+      </LoadState>
+    </div>
+  );
+}
+
+/* ---------------- Payroll ---------------- */
+
+function PayrollTab({ agentId, system }) {
+  const transactions = usePoll(() => fetchTransactions(agentId), {}, [agentId]);
+  const rows = transactions.data ?? [];
+  const executed = rows.filter((row) => row.status === "executed");
+  const sumKind = (kind) => executed.filter((row) => row.kind === kind).reduce((total, row) => total + Number(row.amount_sui), 0);
+  const received = sumKind("salary");
+  const spent = sumKind("spend") + sumKind("topup");
+  return (
+    <div className="tab-body">
+      <LastUpdated state={transactions} label="Transactions" />
+      <div className="card summary-strip">
+        <div><dt>salary received</dt><dd>{sui(received)}</dd></div>
+        <div><dt>spent on upgrades</dt><dd>{sui(spent)}</dd></div>
+        <div><dt>saved</dt><dd>{sui(Math.max(0, received - spent))}</dd></div>
+      </div>
+      <LoadState state={transactions} what="transactions">
+        {rows.length === 0 ? (
+          <div className="state-box"><p>No payroll transactions yet. Salary payments, upgrade spends and treasury top-ups land here.</p></div>
+        ) : (
+          <table className="component-table card">
+            <thead>
+              <tr><th>time</th><th>kind</th><th>amount</th><th>status</th><th>rule</th><th>digest</th><th>confirmed</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((row, index) => (
+                <tr key={index}>
+                  <td>{fmtWhen(row.confirmed_at ?? row.created_at)}</td>
+                  <td><TypeBadge tone={row.kind === "salary" ? "ok" : row.kind === "spend" ? "accent" : "warn"}>{row.kind}</TypeBadge></td>
+                  <td>{row.amount_sui}</td>
+                  <td>{row.status}</td>
+                  <td>{row.rule_result}{row.reason ? ` · ${row.reason}` : ""}</td>
+                  <td><CopyChip value={row.digest} explorer={row.explorer_url ?? explorerTx(system?.data, row.digest)} /></td>
+                  <td>{row.confirmed_at ? fmtWhen(row.confirmed_at) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </LoadState>
+      <p className="muted small-text">Balances and confirmations are read through Tatum's Sui gRPC gateway.</p>
+    </div>
+  );
+}
+
+/* ---------------- Memory (lessons) ---------------- */
+
+function MemoryTab({ agentId }) {
+  const lessons = usePoll(() => fetchLessons(agentId), {}, [agentId]);
+  const list = lessons.data?.lessons ?? [];
+  return (
+    <div className="tab-body">
+      <p className="tab-note muted">These lessons were recalled from Walrus Memory and are used to decide what to propose next.</p>
+      <LastUpdated state={lessons} label="Lessons" />
+      <LoadState state={lessons} what="recalled lessons">
+        {list.length === 0 && !lessons.data?.recall_ok && (
+          <p className="muted small-text">Recall failed against the agent's Walrus namespace: {lessons.data?.recall_error ?? "unavailable"}.</p>
+        )}
+        {list.length === 0 ? (
+          <div className="state-box"><p>No lessons recalled yet for this agent.</p></div>
+        ) : (
+          <table className="component-table card">
+            <thead>
+              <tr><th>kind</th><th>capability</th><th>verdict / category</th><th>detail</th><th>blob</th></tr>
+            </thead>
+            <tbody>
+              {list.map((lesson, index) => (
+                <tr key={index}>
+                  <td><TypeBadge tone={lesson.kind === "upgrade_purchased" ? "accent" : "info"}>{lesson.kind}</TypeBadge></td>
+                  <td>{lesson.capability_key ?? "—"}</td>
+                  <td>{lesson.verdict ?? lesson.task_category ?? "—"}</td>
+                  <td>{lesson.detail ?? "—"}</td>
+                  <td><CopyChip value={lesson.blob_id} note="" /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </LoadState>
+    </div>
+  );
+}
+
+/* ---------------- Agent page shell ---------------- */
+
+const TABS = ["timeline", "reviews", "requests", "verdicts", "payroll", "memory", "score"];
+
 export default function Agent({ system }) {
   const { id } = useParams();
+  const [params, setParams] = useSearchParams();
+  const tab = TABS.includes(params.get("tab")) ? params.get("tab") : "timeline";
+  const highlight = (params.get("highlight") ?? "").split(",").filter(Boolean);
   const agent = usePoll(() => fetchAgent(id), {}, [id]);
-  const [tab, setTab] = useState("timeline");
   const data = agent.data;
   const pass = data?.pass_status;
   const balance = data?.balance;
   const explorerWallet = explorerAccount(system?.data, data?.wallet_address);
 
+  const switchTab = (name, extra = {}) => {
+    setParams({ tab: name, ...extra }, { replace: false });
+  };
+
   return (
     <section className="page-section">
-      <Link to="/" className="back-link">← Overview</Link>
+      <Link to="/dashboard" className="back-link">← All agents</Link>
       <LoadState state={agent} what="the agent">
         {data && (
           <>
@@ -322,14 +768,37 @@ export default function Agent({ system }) {
               )}
             </div>
             <div className="tabs" role="tablist">
-              <button type="button" className={`tab-btn ${tab === "timeline" ? "active" : ""}`} onClick={() => setTab("timeline")} role="tab" aria-selected={tab === "timeline"}>
+              <button type="button" className={`tab-btn ${tab === "timeline" ? "active" : ""}`} onClick={() => switchTab("timeline")} role="tab" aria-selected={tab === "timeline"}>
                 Timeline
               </button>
-              <button type="button" className={`tab-btn ${tab === "score" ? "active" : ""}`} onClick={() => setTab("score")} role="tab" aria-selected={tab === "score"}>
+              <button type="button" className={`tab-btn ${tab === "reviews" ? "active" : ""}`} onClick={() => switchTab("reviews")} role="tab" aria-selected={tab === "reviews"}>
+                Reviews &amp; gaps
+              </button>
+              <button type="button" className={`tab-btn ${tab === "requests" ? "active" : ""}`} onClick={() => switchTab("requests")} role="tab" aria-selected={tab === "requests"}>
+                Requests
+              </button>
+              <button type="button" className={`tab-btn ${tab === "verdicts" ? "active" : ""}`} onClick={() => switchTab("verdicts")} role="tab" aria-selected={tab === "verdicts"}>
+                Verdicts
+              </button>
+              <button type="button" className={`tab-btn ${tab === "payroll" ? "active" : ""}`} onClick={() => switchTab("payroll")} role="tab" aria-selected={tab === "payroll"}>
+                Payroll
+              </button>
+              <button type="button" className={`tab-btn ${tab === "memory" ? "active" : ""}`} onClick={() => switchTab("memory")} role="tab" aria-selected={tab === "memory"}>
+                Memory
+              </button>
+              <button type="button" className={`tab-btn ${tab === "score" ? "active" : ""}`} onClick={() => switchTab("score")} role="tab" aria-selected={tab === "score"}>
                 Score
               </button>
             </div>
-            {tab === "timeline" ? <TimelineTab agentId={id} system={system} /> : <ScoreTab agentId={id} agentState={agent} />}
+            {tab === "timeline" && <TimelineTab agentId={id} system={system} highlightIds={highlight} />}
+            {tab === "reviews" && (
+              <ReviewsTab agentId={id} onJumpToEvent={(eventId) => { switchTab("timeline", { highlight: eventId }); }} />
+            )}
+            {tab === "requests" && <RequestsTab agentId={id} agentState={agent} system={system} />}
+            {tab === "verdicts" && <VerdictsTab agentId={id} />}
+            {tab === "payroll" && <PayrollTab agentId={id} system={system} />}
+            {tab === "memory" && <MemoryTab agentId={id} />}
+            {tab === "score" && <ScoreTab agentId={id} agentState={agent} />}
           </>
         )}
       </LoadState>
