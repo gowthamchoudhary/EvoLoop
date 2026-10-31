@@ -39,7 +39,8 @@ work → remember → review → ask → pay → upgrade → prove → (remember
 16. [Demo cycle and portable-memory proof](#demo-cycle-and-portable-memory-proof)
 17. [Environment reference](#environment-reference)
 18. [Smoke tests and scripts](#smoke-tests-and-scripts)
-19. [Security notes](#security-notes)
+19. [Accounts, sessions, workspaces and ownership (Phase B1)](#accounts-sessions-workspaces-and-ownership-phase-b1)
+20. [Security notes](#security-notes)
 
 ---
 
@@ -93,6 +94,8 @@ Variable (defaults)                                              | Purpose
 `PREMIUM_PASS_CALLS` (`20`), `PREMIUM_PASS_TTL_MINUTES` (`1440`), `PREMIUM_VERIFY_POLL_MS` (`40000`) | Premium pass size, lifetime, and the longest a claim waits for Tatum to index a transaction
 `DEMO_ACTIONS_ENABLED` (`false`), `DEMO_MAX_APPROVALS_PER_HOUR` (`6`), `DEMO_MAX_APPROVALS_PER_IP_PER_HOUR` (`2`) | Demo approve/reject in the dashboard, off by default
 `PUBLIC_RATE_LIMIT_PER_MIN` (`60` per IP), `PUBLIC_BALANCE_CACHE_SECONDS` (`20`) | Public API safety
+`APP_ORIGIN` (`http://127.0.0.1:8787`)                  | Allowed `Origin` for browser auth/session calls (CSRF guard); `http://localhost:5173` is also allowed in development
+`SESSION_TTL_DAYS` (`30`, clamped `1..180`)              | Browser session lifetime; guests always get a 12-hour session
 
 ---
 
@@ -483,9 +486,66 @@ Sends no money:
 
 ---
 
+## Accounts, sessions, workspaces and ownership (Phase B1)
+
+### Auth model
+
+- **Email + password** — `POST /v1/auth/register`, `POST /v1/auth/login`. Passwords: scrypt (`N=16384, r=8, p=1`, 64-byte key, 16-byte random salt) stored as `s2_<salt>$<hash>`, compared with `timingSafeEqual`, minimum length 10 with a small weak-password blocklist. Wrong credentials always return the generic `401 "invalid email or password"`.
+- **Sui wallet sign-in** — `GET /v1/auth/wallet/nonce?purpose=login|link` issues a single-use nonce (48 hex chars, consumed on first use, 5-minute TTL); the server builds the message (`EvoLoop sign-in + nonce + configured network + issued-at`) and `POST /v1/auth/wallet` verifies the personal-message signature with `@mysten/sui/verify`'s `verifyPersonalMessageSignature`, asserting the recovered key derives exactly the claimed `0x…` address (64 hex after normalization). A wallet-first login creates the user **and** their personal workspace.
+- **Guest sessions** — `POST /v1/auth/guest` creates a role-`guest` user with a 12-hour session, attached read-only (`viewer`) to `ws_default`. Guests can never create agents or move money.
+
+### Sessions
+
+- Cookie `evl_session`: `HttpOnly; SameSite=Lax; Path=/`, `Secure` whenever the request is HTTPS (`X-Forwarded-Proto`) or `NODE_ENV=production`, `Max-Age` from `SESSION_TTL_DAYS` (default 30 days; guests 12 h).
+- The database stores only `sha256(raw token)` as the session id (`ip_hash` + `user_agent_hash` are stored hashed too); the raw token lives only in the cookie and is never returned in any JSON body.
+- No `Authorization: Bearer` fallback for browser sessions.
+- Expired sessions and stale nonces are pruned at boot and hourly.
+
+### CSRF guard and rate limits
+
+Every state-changing `/v1/auth/*` and `/v1/my/*` call requires the header `X-EvoLoop-Client: web` and — when an `Origin` header is present — an origin matching `APP_ORIGIN` (plus `http://localhost:5173` in development); otherwise `403 csrf_blocked`.
+
+| Endpoint group | Limit |
+| --- | --- |
+| `POST /v1/auth/register` | 10/min per IP |
+| `POST /v1/auth/login` | 15/min per IP **and** 8 failed attempts per email per 15 min → 429 for that email for 15 min |
+| `GET /v1/auth/wallet/nonce` | 30/min per IP |
+| `POST /v1/auth/wallet` | 20/min per IP |
+| `POST /v1/auth/guest` | 20/min per IP |
+| `GET /v1/auth/session`, `POST /v1/auth/logout` | 120/min per IP |
+| `/v1/my/*` mutations | 60/min per IP |
+
+### Workspaces and ownership
+
+- Every user gets a **personal workspace** at registration (role `owner` in `workspace_members`). Existing agents live in the backfilled `ws_default` where demo agents and all `ADMIN_TOKEN` routes continue to operate exactly as before.
+- `agents.workspace_id` (defaults to `ws_default`) resolves every record's workspace; the ownership API under `/v1/my` checks membership and answers **404 (not 403)** for records in other workspaces so their existence never leaks.
+- **Role matrix:** `owner` = everything; `approver` = approve/reject requests; `viewer` (incl. guests) = read-only.
+- **Per-workspace treasury:** `workspaces.treasury_wallet_ref` → `wallets(owner_type='treasury', owner_id=ref)`. `ws_default` keeps the legacy global treasury row; new workspaces create a fresh encrypted keypair lazily via `POST /v1/my/workspace/treasury` (never at signup). Payroll and upgrade top-ups resolve the treasury from the **agent's workspace** (`src/wallets.js` + `src/auth.js::treasuryWalletForAgent`), never from a global lookup.
+- **Agent lifecycle pause:** `agents.status='paused'` blocks spend and payroll (paused agents are skipped, not paid) and `/v1/events` answers `423 agent_paused` for that agent's key. `archive` (status `archived`) retires the key entirely.
+
+### `/v1/*` route list (Phase B1)
+
+| Group | Method + path | Who | Notes |
+| --- | --- | --- | --- |
+| Account | `POST /v1/auth/register` · `/login` · `/logout` · `/guest`, `GET /v1/auth/session`, `GET /v1/auth/wallet/nonce`, `POST /v1/auth/wallet` | public (session where noted) | Session cookie in, user + workspace summary out; raw token never in a body |
+| Workspace | `GET /v1/my/workspace` (workspace, role, treasury address + live balance) · `POST /v1/my/workspace/treasury` (owner) | session | |
+| Agents | `GET/POST /v1/my/agents`, `GET /v1/my/agents/:id`, `PATCH /v1/my/agents/:id`, `PUT /v1/my/agents/:id/settings` · `/policy` (owner, same validation as admin routes), `POST /v1/my/agents/:id/pause` · `/resume` · `/rotate-key` · `/archive`, `GET /v1/my/agents/:id/{events,reviews,scores,transactions,verdicts,lessons,guidance}` | session + membership | Agent creation registers exactly like the admin route, creates the agent wallet, applies default policy/settings (0.05 SUI weekly allowance, 40% reserve, autonomy `ask`, 0.03 SUI per-tx cap) and returns the API key **once** |
+| Requests | `GET /v1/my/requests`, `GET /v1/my/requests/:id`, `POST /v1/my/requests/:id/approve` · `/reject` (owner/approver; `decided_by: user:<id>`) | session | Viewer gets `403` |
+| Payroll | `POST /v1/my/payroll/run {agent_ids?, period_label}` (owner; workspace agents only; workspace treasury; clear refusals when no treasury or insufficient balance) | session | |
+
+### Custody statement
+
+On **testnet**, the server holds the agent wallet signing keys — generated server-side and persisted **AES-256-GCM-encrypted** with `WALLET_ENC_KEY`. Salaries and upgrade payments are transfers from workspace treasuries and agent wallets by the server itself; no dashboard/browser code ever sees a private key.
+
+### Verification (no transfers)
+
+`npm run smoke:auth` exercises the full matrix against a live server + real SQLite: cookie flags (HttpOnly/`SameSite=Lax`; `Secure` added under `X-Forwarded-Proto: https`), no raw token in bodies vs `sessions.id = sha256(token)` in the DB, generic login errors, the 8-failure email lockout, 409 duplicate email, CSRF blocks, key-once agent creation, cross-workspace `404`s, pause → `423` → resume, key rotation, guest read-only rules, logout invalidation, and single-use wallet nonces. `npm run smoke:public` and `npm run smoke:block3` (no-transfer) confirm the pre-existing behavior is unchanged.
+
 ## Security notes
 
 - `ADMIN_TOKEN` authorizes admin routes; agent keys are one-time secrets returned at registration. Neither appears in browser code.
+- Browser sessions: cookie `HttpOnly; SameSite=Lax` (+ `Secure` on HTTPS), `sha256` at rest, CSRF double-guard (`X-EvoLoop-Client` + `Origin` allowlist), email lockout after 8 failed logins, and per-user rate limits (see the table above).
+- Ownership API answers `404` for cross-workspace records — no existence oracle; guest and `viewer` roles cannot mutate anything.
 - Wallet signing keys are persisted **encrypted** with `WALLET_ENC_KEY`.
 - Execution is serialized per agent; a decided request returns 409 rather than paying twice.
 - Demo actions default to **disabled off**, are testnet-only, rate-limited hourly (global and per salted-hash IP), and never execute transfers.

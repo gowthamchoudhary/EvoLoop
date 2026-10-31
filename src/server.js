@@ -25,6 +25,15 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { registerPublicRoutes } from "./public-routes.js";
 import { PUBLIC_RATE_LIMIT_PER_MIN } from "./public-config.js";
+import {
+  authenticateMy, canApprove, clearFailedLogin, clearSessionCookie, clientIp,
+  createGuestUserAndSession, createNonce, createSessionToken, createWorkspaceForUser,
+  csrfGuard, destroySessionByRequest, hashPassword, isWeakPassword,
+  loginLockRemainingMs, membershipForAgent, memberRoleFor,
+  pruneAuthTables, publicUser, rateAllowed, recordFailedLogin, sessionUserForRequest,
+  setSessionCookie, takeNonce, treasuryRefForWorkspace, treasuryWalletForAgent,
+  verifyPassword, verifyWalletSignature, walletMessage, workspaceForUser,
+} from "./auth.js";
 
 export const eventTypes = z.enum([
   "task_completed",
@@ -152,6 +161,168 @@ function authError(reply) {
   return reply.code(401).send({ error: "unauthorized" });
 }
 
+/* Phase B1 helpers ---------------------------------------------------------------- */
+
+/** Agent-key lookup that also matches paused agents so /v1/events and /v1/spend can 423. */
+function agentForKeyIncludingPaused(token) {
+  if (!token) return null;
+  const tokenHash = sha256(token);
+  const agents = getDatabase().prepare("SELECT * FROM agents WHERE status IN ('active','paused')").all();
+  return agents.find((agent) => equalHash(agent.api_key_hash, tokenHash)) ?? null;
+}
+
+function pausedAgentGuard(agent, reply) {
+  if (agent?.status === "paused") {
+    reply.code(423).send({ error: "agent_paused", hint: "resume the agent from the workspace settings" });
+    return false;
+  }
+  return true;
+}
+
+function workspaceSummary(workspace) {
+  if (!workspace) return null;
+  const ref = workspace.treasury_wallet_ref ?? (workspace.id === "ws_default" ? "treasury" : workspace.id);
+  const treasury = getWallet("treasury", ref);
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    network: workspace.network,
+    status: workspace.status,
+    treasury_address: treasury?.address ?? null,
+  };
+}
+
+const PAYROLL_GAS_PER_AGENT = 50_000_000n;
+
+/**
+ * Shared payroll execution (admin /v1/payroll/run + owner /v1/my/payroll/run).
+ * Money logic unchanged; the treasury is resolved per agent's workspace instead
+ * of one global lookup (ws_default keeps owner_id 'treasury').
+ * Returns { status, body } so callers reply.code(status).send(body).
+ */
+async function payrollRun({ periodLabel, agentIds = null, workspaceId = null }) {
+  const db = getDatabase();
+  let agents;
+  const requestedIds = agentIds?.length ? [...new Set(agentIds)] : null;
+  if (requestedIds) {
+    const placeholders = requestedIds.map(() => "?").join(",");
+    agents = workspaceId
+      ? db.prepare(`SELECT id,name,workspace_id FROM agents WHERE id IN (${placeholders}) AND workspace_id=? AND status='active' ORDER BY created_at`).all(...requestedIds, workspaceId)
+      : db.prepare(`SELECT id,name,workspace_id FROM agents WHERE id IN (${placeholders}) AND status='active' ORDER BY created_at`).all(...requestedIds);
+  } else {
+    agents = workspaceId
+      ? db.prepare("SELECT id,name,workspace_id FROM agents WHERE workspace_id=? AND status='active' ORDER BY created_at").all(workspaceId)
+      : db.prepare("SELECT id,name,workspace_id FROM agents WHERE status='active' ORDER BY created_at").all();
+  }
+  const eligible = agents
+    .map((agent) => ({
+      agent,
+      wallet: getWallet("agent", agent.id),
+      policy: db.prepare("SELECT * FROM policies WHERE agent_id=?").get(agent.id),
+      treasury_ref: treasuryRefForWorkspace(agent.workspace_id ?? "ws_default"),
+    }))
+    .filter((item) => item.wallet && item.policy);
+  if (agents.length && !eligible.length) return { status: 409, body: { error: "no active agents have both a wallet and payroll policy" } };
+  if (!eligible.length) return { status: 200, body: { period_label: periodLabel, paid: [], skipped: agents.length } };
+
+  const byRef = new Map();
+  for (const item of eligible) {
+    if (!byRef.has(item.treasury_ref)) byRef.set(item.treasury_ref, []);
+    byRef.get(item.treasury_ref).push(item);
+  }
+  const groups = [];
+  for (const [ref, items] of byRef) {
+    const treasury = getWallet("treasury", ref);
+    if (!treasury) return { status: 409, body: { error: "treasury wallet has not been created", workspace_treasury_ref: ref } };
+    const salariesRequired = items.reduce((sum, item) => sum + BigInt(item.policy.salary_mist), 0n);
+    const estimatedGas = BigInt(items.length) * PAYROLL_GAS_PER_AGENT;
+    const required = salariesRequired + estimatedGas;
+    const treasuryBalance = await getPayrollBalance(treasury.address);
+    if (treasuryBalance < required) {
+      return {
+        status: 402,
+        body: {
+          error: "insufficient treasury balance for payroll and transaction gas",
+          treasury_address: treasury.address,
+          balance_sui: formatMist(treasuryBalance),
+          required_sui: formatMist(required),
+          agent_ids: items.map(({ agent }) => agent.id),
+          total_required_sui: formatMist(required),
+          estimated_gas_sui: formatMist(estimatedGas),
+          treasury_balance_sui: formatMist(treasuryBalance),
+        },
+      };
+    }
+    groups.push({ treasury, items });
+  }
+
+  const paid = [];
+  for (const { treasury, items } of groups) {
+    for (const item of items) {
+      const amount = BigInt(item.policy.salary_mist);
+      const txId = `pay_${randomUUID()}`;
+      try {
+        const confirmation = await transferSui(treasury, item.wallet.address, amount, {
+          onExecuted: (execution) => db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,checkpoint,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), execution.error ?? "execution_submitted", execution.status, execution.digest, execution.confirmedAt, execution.checkpoint, new Date().toISOString()),
+        });
+        const createdAt = new Date().toISOString();
+        const start = periodStart(item.agent.id);
+        const spent = spentSince(item.agent.id, start);
+        const saved = amount - spent;
+        const payslipId = `slip_${randomUUID()}`;
+        const transaction = db.transaction(() => {
+          db.prepare(`UPDATE transactions SET rule_result=?,status=?,digest=?,confirmed_at=?,checkpoint=? WHERE id=?`)
+            .run(confirmation.error ?? "salary_paid", confirmation.status === "success" ? "executed" : confirmation.status, confirmation.digest, confirmation.confirmedAt, confirmation.checkpoint, txId);
+          db.prepare(`INSERT INTO payslips(id,agent_id,period_label,salary_mist,spent_mist,saved_mist,salary_digest,created_at)
+            VALUES(?,?,?,?,?,?,?,?)`).run(payslipId, item.agent.id, periodLabel, amount.toString(), spent.toString(), saved.toString(), confirmation.digest, createdAt);
+        });
+        transaction();
+        paid.push({ agent_id: item.agent.id, salary_sui: formatMist(amount), digest: confirmation.digest, status: confirmation.status, payslip_id: payslipId });
+      } catch (error) {
+        const failure = reportTransferFailure(error);
+        const existing = db.prepare("SELECT id FROM transactions WHERE id=?").get(txId);
+        if (existing) db.prepare("UPDATE transactions SET rule_result=?,status='failed',digest=COALESCE(?,digest),confirmed_at=?,checkpoint=? WHERE id=?")
+          .run(`${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, error.checkpoint ?? null, txId);
+        else db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,created_at)
+            VALUES(?,?,?,?,?,?, 'failed',?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), `${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, new Date().toISOString());
+        return { status: 502, body: { error: "payroll transfer failed", stage: failure.stage, message: failure.message, paid, failed_agent_id: item.agent.id } };
+      }
+    }
+  }
+  return { status: 200, body: { period_label: periodLabel, paid, skipped: agents.length - eligible.length } };
+}
+
+const authRegisterSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  email: z.string().trim().email().max(200),
+  password: z.string().min(10).max(200),
+});
+const authLoginSchema = z.object({
+  email: z.string().trim().email().max(200),
+  password: z.string().min(1).max(200),
+});
+const walletAuthSchema = z.object({
+  purpose: z.enum(["login", "link"]).default("login"),
+  nonce: z.string().trim().min(16).max(128),
+  address: z.string().trim().min(40).max(80),
+  signature: z.string().trim().min(10),
+  message: z.string().trim().min(10),
+});
+const myAgentCreateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  kind: z.string().trim().min(1).max(80),
+  description: z.string().trim().min(1).max(500),
+});
+const myAgentPatchSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().min(1).max(500).optional(),
+}).refine((value) => value.name !== undefined || value.description !== undefined, { message: "nothing to update" });
+const myPayrollSchema = z.object({
+  agent_ids: z.array(z.string().trim().min(1).max(120)).max(200).optional(),
+  period_label: z.string().trim().min(1).max(100),
+});
+
 function parseEventRows(rows) {
   return rows.map(({ details_json, ...row }) => ({ ...row, details: details_json ? JSON.parse(details_json) : null }));
 }
@@ -163,7 +334,10 @@ function publicTransaction(row) {
 export async function buildServer() {
   initDatabase();
   pruneTatumCalls();
+  pruneAuthTables();
   resumePendingMemories();
+  const authPruneTimer = setInterval(() => { try { pruneAuthTables(); } catch { /* keep serving */ } }, 60 * 60 * 1000);
+  authPruneTimer.unref?.();
   const app = Fastify({ logger: false });
 
   await app.register(rateLimit,{global:true,max:PUBLIC_RATE_LIMIT_PER_MIN,timeWindow:60_000,allowList:(request)=>!request.url.startsWith("/public/v1/")});
@@ -190,6 +364,476 @@ export async function buildServer() {
   });
 
   app.put("/v1/agents/:id/visibility",async(request,reply)=>{if(!isAdminToken(bearerToken(request)))return authError(reply);const parsed=visibilitySchema.safeParse(request.body);if(!parsed.success)return reply.code(400).send({error:"invalid request",issues:parsed.error.issues});const changed=getDatabase().prepare("UPDATE agents SET public=?,demo_actionable=? WHERE id=?").run(parsed.data.public?1:0,parsed.data.demo_actionable?1:0,request.params.id);if(!changed.changes)return reply.code(404).send({error:"agent not found"});return {agent_id:request.params.id,public:parsed.data.public,demo_actionable:parsed.data.demo_actionable};});
+
+  /* ================= Phase B1: accounts, sessions, workspaces ================ */
+  // All /v1/auth and /v1/my state-changing calls require the web-client header
+  // and (when present) a same-app Origin; the rest is rate limited per IP.
+
+  app.post("/v1/auth/register", async (request, reply) => {
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("register", clientIp(request), 10)) return reply.code(429).send({ error: "rate_limited" });
+    const parsed = authRegisterSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    if (isWeakPassword(parsed.data.password)) return reply.code(400).send({ error: "password is too common" });
+    const db = getDatabase();
+    const email = parsed.data.email.toLowerCase();
+    if (db.prepare("SELECT 1 FROM users WHERE email=?").get(email)) return reply.code(409).send({ error: "email already registered" });
+    const userId = `usr_${randomUUID()}`;
+    try {
+      db.prepare("INSERT INTO users(id,email,password_hash,name,role,created_at,last_login_at) VALUES(?,?,?,?,?,?,?)")
+        .run(userId, email, hashPassword(parsed.data.password), parsed.data.name, "user", new Date().toISOString(), new Date().toISOString());
+    } catch (error) {
+      if (String(error?.code ?? "").startsWith("SQLITE_CONSTRAINT")) return reply.code(409).send({ error: "email already registered" });
+      throw error;
+    }
+    const user = db.prepare("SELECT * FROM users WHERE id=?").get(userId);
+    const workspace = createWorkspaceForUser(publicUser(user));
+    const token = createSessionToken(userId, request);
+    setSessionCookie(reply, request, token);
+    return reply.code(201).send({ user: publicUser(user), workspace: workspaceSummary(workspace) });
+  });
+
+  app.post("/v1/auth/login", async (request, reply) => {
+    if (!csrfGuard(request, reply)) return;
+    const parsed = authLoginSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    if (!rateAllowed("login-ip", clientIp(request), 15)) return reply.code(429).send({ error: "rate_limited" });
+    const email = parsed.data.email.toLowerCase();
+    const lockMs = loginLockRemainingMs(email);
+    if (lockMs > 0) return reply.code(429).send({ error: "too_many_failed_attempts", retry_in_seconds: Math.ceil(lockMs / 1000) });
+    const user = getDatabase().prepare("SELECT * FROM users WHERE email=?").get(email);
+    if (!user || !user.password_hash || !verifyPassword(parsed.data.password, user.password_hash)) {
+      recordFailedLogin(email);
+      return reply.code(401).send({ error: "invalid email or password" });
+    }
+    clearFailedLogin(email);
+    getDatabase().prepare("UPDATE users SET last_login_at=? WHERE id=?").run(new Date().toISOString(), user.id);
+    const token = createSessionToken(user.id, request);
+    setSessionCookie(reply, request, token);
+    return reply.send({ user: publicUser(user), workspace: workspaceSummary(workspaceForUser(publicUser(user))) });
+  });
+
+  app.post("/v1/auth/logout", async (request, reply) => {
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("session", clientIp(request), 120)) return reply.code(429).send({ error: "rate_limited" });
+    destroySessionByRequest(request);
+    clearSessionCookie(reply, request);
+    return reply.send({ ok: true });
+  });
+
+  app.get("/v1/auth/session", async (request, reply) => {
+    if (!rateAllowed("session", clientIp(request), 120)) return reply.code(429).send({ error: "rate_limited" });
+    const user = sessionUserForRequest(request);
+    if (!user) {
+      if (request.headers.cookie?.includes("evl_session=")) clearSessionCookie(reply, request);
+      return reply.code(401).send({ error: "sign in required" });
+    }
+    const workspace = workspaceForUser(user);
+    return reply.send({
+      user,
+      workspace: workspace ? { ...workspaceSummary(workspace), role: memberRoleFor(workspace.id, user.id) ?? (user.role === "guest" ? "viewer" : "owner") } : null,
+    });
+  });
+
+  app.post("/v1/auth/guest", async (request, reply) => {
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("guest", clientIp(request), 20)) return reply.code(429).send({ error: "rate_limited" });
+    const { user, token } = createGuestUserAndSession(request);
+    setSessionCookie(reply, request, token);
+    return reply.code(201).send({ user, workspace: workspaceSummary(workspaceForUser(user)) });
+  });
+
+  app.get("/v1/auth/wallet/nonce", async (request, reply) => {
+    if (!rateAllowed("nonce", clientIp(request), 30)) return reply.code(429).send({ error: "rate_limited" });
+    const purpose = request.query.purpose === "link" ? "link" : "login";
+    if (purpose === "link" && !sessionUserForRequest(request)) return reply.code(401).send({ error: "sign in required" });
+    const nonce = createNonce(purpose);
+    return reply.send({ nonce: nonce.nonce, purpose, message: walletMessage(nonce), expires_in_seconds: 300 });
+  });
+
+  app.post("/v1/auth/wallet", async (request, reply) => {
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("wallet", clientIp(request), 20)) return reply.code(429).send({ error: "rate_limited" });
+    const parsed = walletAuthSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const db = getDatabase();
+    const nonceRow = takeNonce(parsed.data.nonce, parsed.data.purpose);
+    if (!nonceRow) return reply.code(400).send({ error: "nonce expired or unknown" });
+    const verified = await verifyWalletSignature({
+      message: parsed.data.message,
+      signature: parsed.data.signature,
+      expectedAddress: parsed.data.address,
+      expectedMessage: walletMessage(nonceRow),
+    });
+    if (!verified.ok) return reply.code(400).send({ error: verified.error, ...(verified.detail ? { detail: verified.detail } : {}) });
+
+    if (parsed.data.purpose === "link") {
+      const user = sessionUserForRequest(request);
+      if (!user) return reply.code(401).send({ error: "sign in required" });
+      const existing = db.prepare("SELECT id FROM users WHERE wallet_address=?").get(verified.address);
+      if (existing && existing.id !== user.id) return reply.code(409).send({ error: "address already linked to another account" });
+      db.prepare("UPDATE users SET wallet_address=?,wallet_verified_at=? WHERE id=?").run(verified.address, new Date().toISOString(), user.id);
+      return reply.send({ user: publicUser(db.prepare("SELECT * FROM users WHERE id=?").get(user.id)) });
+    }
+
+    let user = db.prepare("SELECT * FROM users WHERE wallet_address=?").get(verified.address);
+    if (!user) {
+      const sessionOwner = sessionUserForRequest(request);
+      if (sessionOwner) {
+        const taken = db.prepare("SELECT id FROM users WHERE wallet_address=?").get(verified.address);
+        if (taken && taken.id !== sessionOwner.id) return reply.code(409).send({ error: "address already linked to another account" });
+        db.prepare("UPDATE users SET wallet_address=?,wallet_verified_at=?,last_login_at=? WHERE id=?").run(verified.address, new Date().toISOString(), new Date().toISOString(), sessionOwner.id);
+        user = db.prepare("SELECT * FROM users WHERE id=?").get(sessionOwner.id);
+      } else {
+        const userId = `usr_${randomUUID()}`;
+        db.prepare("INSERT INTO users(id,name,wallet_address,wallet_verified_at,role,created_at,last_login_at) VALUES(?,?,?,?,?,?,?)")
+          .run(userId, `Sui owner ${verified.address.slice(2, 8)}`, verified.address, new Date().toISOString(), "user", new Date().toISOString(), new Date().toISOString());
+        user = db.prepare("SELECT * FROM users WHERE id=?").get(userId);
+        createWorkspaceForUser(publicUser(user));
+      }
+    } else {
+      db.prepare("UPDATE users SET last_login_at=? WHERE id=?").run(new Date().toISOString(), user.id);
+    }
+    const token = createSessionToken(user.id, request);
+    setSessionCookie(reply, request, token);
+    return reply.send({ user: publicUser(user), workspace: workspaceSummary(workspaceForUser(publicUser(user))) });
+  });
+
+  /* ====================== workspace-scoped ownership API ===================== */
+  // Session required on every /v1/my route. Records that exist but belong to
+  // another workspace answer 404 so existence is not leaked.
+
+  app.get("/v1/my/workspace", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    const ref = workspace.treasury_wallet_ref ?? (workspace.id === "ws_default" ? "treasury" : workspace.id);
+    const treasury = getWallet("treasury", ref);
+    let balance = null;
+    if (treasury) {
+      try {
+        const b = await getPayrollBalanceBreakdown(treasury.address, { bypassCache: true });
+        balance = { address: treasury.address, balance_mist: b.totalBalance.toString(), balance_sui: formatMist(b.totalBalance) };
+      } catch {
+        balance = { address: treasury.address, balance_mist: null, balance_sui: null };
+      }
+    }
+    return reply.send({
+      workspace: workspaceSummary(workspace),
+      role: memberRoleFor(workspace.id, user.id) ?? (user.role === "guest" ? "viewer" : "owner"),
+      treasury,
+    });
+  });
+
+  app.post("/v1/my/workspace/treasury", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("my-mutate", clientIp(request), 60)) return reply.code(429).send({ error: "rate_limited" });
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    if (memberRoleFor(workspace.id, user.id) !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const ref = treasuryRefForWorkspace(workspace.id);
+    if (workspace.treasury_wallet_ref !== ref) {
+      getDatabase().prepare("UPDATE workspaces SET treasury_wallet_ref=? WHERE id=?").run(ref, workspace.id);
+    }
+    const wallet = createWallet("treasury", ref);
+    return reply.code(201).send({ address: wallet.address });
+  });
+
+  app.get("/v1/my/agents", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    const rows = getDatabase().prepare(`
+      SELECT a.id,a.name,a.kind,a.description,a.status,a.custody,a.payout_address,a.workspace_id,a.created_at,
+        w.address AS wallet_address
+      FROM agents a LEFT JOIN wallets w ON w.owner_type='agent' AND w.owner_id=a.id
+      WHERE a.workspace_id=? ORDER BY a.created_at DESC
+    `).all(workspace.id);
+    return reply.send({ workspace_id: workspace.id, role: memberRoleFor(workspace.id, user.id) ?? (user.role === "guest" ? "viewer" : "owner"), agents: rows });
+  });
+
+  app.post("/v1/my/agents", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    if (!csrfGuard(request, reply)) return;
+    if (!rateAllowed("my-mutate", clientIp(request), 60)) return reply.code(429).send({ error: "rate_limited" });
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    const role = memberRoleFor(workspace.id, user.id);
+    if (role !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const parsed = myAgentCreateSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const db = getDatabase();
+    const baseSlug = parsed.data.name.normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agent";
+    let agentId;
+    for (let i = 0; i < 5; i += 1) {
+      agentId = `${baseSlug}-${randomBytes(2).toString("hex")}`;
+      if (!db.prepare("SELECT 1 FROM agents WHERE id=?").get(agentId)) break;
+    }
+    const apiKey = `plk_${randomBytes(32).toString("hex")}`;
+    const createdAt = new Date().toISOString();
+    const wallet = createWallet("agent", agentId);
+    db.prepare("INSERT INTO agents(id,name,kind,description,api_key_hash,created_at,status,workspace_id,owner_user_id,custody) VALUES(?,?,?,?,?,?,?,?,?,?)")
+      .run(agentId, parsed.data.name, parsed.data.kind, parsed.data.description, sha256(apiKey), createdAt, "active", workspace.id, user.id, "server");
+    db.prepare(`INSERT INTO policies(agent_id,salary_mist,per_tx_cap_mist,period_cap_mist,allowed_vendor_ids_json,updated_at) VALUES(?,?,?,?,?,?)`)
+      .run(agentId, "50000000", "30000000", "50000000", "[]", createdAt);
+    db.prepare(`INSERT INTO agent_settings(agent_id,period,period_minutes,allowance_mist,improvement_reserve_pct,autonomy,auto_limit_mist,rollover,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(agentId, "weekly", null, "50000000", 40, "ask", "0", 0, createdAt);
+    return reply.code(201).send({
+      agent_id: agentId,
+      api_key: apiKey,
+      wallet_address: wallet.address,
+      custody: "server",
+      policy: { salary_sui: "0.050", per_tx_cap_sui: "0.030", period_cap_sui: "0.050", allowed_vendor_ids: [] },
+      settings: { period: "weekly", allowance_mist: "50000000", improvement_reserve_pct: 40, autonomy: "ask", rollover: false },
+    });
+  });
+
+  function myAgentContext(request, reply, user) {
+    const ctx = membershipForAgent(request.params.id, user.id);
+    if (!ctx) {
+      reply.code(404).send({ error: "agent not found" });
+      return null;
+    }
+    return ctx;
+  }
+
+  app.get("/v1/my/agents/:id", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    const ctx = myAgentContext(request, reply, user);
+    if (!ctx) return;
+    const wallet = getWallet("agent", ctx.agent.id);
+    return reply.send({
+      agent: { id: ctx.agent.id, name: ctx.agent.name, kind: ctx.agent.kind, description: ctx.agent.description, status: ctx.agent.status, custody: ctx.agent.custody, payout_address: ctx.agent.payout_address, workspace_id: ctx.agent.workspace_id, created_at: ctx.agent.created_at, wallet_address: wallet?.address ?? null },
+      role: ctx.membership.role,
+      settings: settingsFor(ctx.agent.id),
+      policy: getDatabase().prepare("SELECT agent_id,salary_mist,per_tx_cap_mist,period_cap_mist,allowed_vendor_ids_json,updated_at FROM policies WHERE agent_id=?").get(ctx.agent.id) ?? null,
+    });
+  });
+
+  app.patch("/v1/my/agents/:id", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myAgentContext(request, reply, user);
+    if (!ctx) return;
+    if (ctx.membership.role !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const parsed = myAgentPatchSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const updates = [];
+    const params = [];
+    if (parsed.data.name !== undefined) { updates.push("name=?"); params.push(parsed.data.name); }
+    if (parsed.data.description !== undefined) { updates.push("description=?"); params.push(parsed.data.description); }
+    params.push(ctx.agent.id);
+    getDatabase().prepare(`UPDATE agents SET ${updates.join(", ")} WHERE id=?`).run(...params);
+    return reply.send({ agent_id: ctx.agent.id, name: parsed.data.name ?? ctx.agent.name, description: parsed.data.description ?? ctx.agent.description });
+  });
+
+  app.put("/v1/my/agents/:id/settings", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myAgentContext(request, reply, user);
+    if (!ctx) return;
+    if (ctx.membership.role !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const parsed = settingsSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const settings = parsed.data;
+    getDatabase().prepare(`INSERT INTO agent_settings(agent_id,period,period_minutes,allowance_mist,improvement_reserve_pct,autonomy,auto_limit_mist,rollover,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(agent_id) DO UPDATE SET period=excluded.period, period_minutes=excluded.period_minutes,
+        allowance_mist=excluded.allowance_mist, improvement_reserve_pct=excluded.improvement_reserve_pct,
+        autonomy=excluded.autonomy, auto_limit_mist=excluded.auto_limit_mist, rollover=excluded.rollover,
+        updated_at=excluded.updated_at`).run(
+      ctx.agent.id, settings.period, settings.period_minutes, settings.allowance_mist,
+      settings.improvement_reserve_pct, settings.autonomy, settings.auto_limit_mist,
+      settings.rollover === true || settings.rollover === 1 ? 1 : 0, new Date().toISOString(),
+    );
+    return reply.send(settingsFor(ctx.agent.id));
+  });
+
+  app.put("/v1/my/agents/:id/policy", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myAgentContext(request, reply, user);
+    if (!ctx) return;
+    if (ctx.membership.role !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const parsed = walletPolicySchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    let salaryMist, perTxMist, periodMist;
+    try {
+      salaryMist = suiToMist(parsed.data.salary_sui);
+      perTxMist = suiToMist(parsed.data.per_tx_cap_sui);
+      periodMist = suiToMist(parsed.data.period_cap_sui);
+    } catch (error) {
+      return reply.code(400).send({ error: safeText(error.message) });
+    }
+    const allowed = [...new Set(parsed.data.allowed_vendor_ids)];
+    if (allowed.length) {
+      const placeholders = allowed.map(() => "?").join(",");
+      const found = getDatabase().prepare(`SELECT id FROM vendors WHERE id IN (${placeholders})`).all(...allowed).map((row) => row.id);
+      if (found.length !== allowed.length) return reply.code(400).send({ error: "allowed_vendor_ids contains an unknown vendor" });
+    }
+    getDatabase().prepare(`INSERT INTO policies(agent_id,salary_mist,per_tx_cap_mist,period_cap_mist,allowed_vendor_ids_json,updated_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET salary_mist=excluded.salary_mist,
+      per_tx_cap_mist=excluded.per_tx_cap_mist,period_cap_mist=excluded.period_cap_mist,
+      allowed_vendor_ids_json=excluded.allowed_vendor_ids_json,updated_at=excluded.updated_at`)
+      .run(ctx.agent.id, salaryMist.toString(), perTxMist.toString(), periodMist.toString(), JSON.stringify(allowed), new Date().toISOString());
+    return reply.send({ agent_id: ctx.agent.id, salary_sui: formatMist(salaryMist), per_tx_cap_sui: formatMist(perTxMist), period_cap_sui: formatMist(periodMist), allowed_vendor_ids: allowed });
+  });
+
+  function myAgentStatusMutation(status) {
+    return async (request, reply) => {
+      const user = authenticateMy(request, reply);
+      if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+      const ctx = myAgentContext(request, reply, user);
+      if (!ctx) return;
+      if (ctx.membership.role !== "owner") return reply.code(403).send({ error: "owner role required" });
+      getDatabase().prepare("UPDATE agents SET status=? WHERE id=?").run(status, ctx.agent.id);
+      return reply.send({ agent_id: ctx.agent.id, status });
+    };
+  }
+
+  app.post("/v1/my/agents/:id/pause", myAgentStatusMutation("paused"));
+  app.post("/v1/my/agents/:id/resume", myAgentStatusMutation("active"));
+
+  app.post("/v1/my/agents/:id/rotate-key", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myAgentContext(request, reply, user);
+    if (!ctx) return;
+    if (ctx.membership.role !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const apiKey = `plk_${randomBytes(32).toString("hex")}`;
+    getDatabase().prepare("UPDATE agents SET api_key_hash=? WHERE id=?").run(sha256(apiKey), ctx.agent.id);
+    return reply.send({ agent_id: ctx.agent.id, api_key: apiKey });
+  });
+
+  app.post("/v1/my/agents/:id/archive", myAgentStatusMutation("archived"));
+
+  app.get("/v1/my/requests", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    const agentIds = getDatabase().prepare("SELECT id FROM agents WHERE workspace_id=? ORDER BY created_at").all(workspace.id).map((row) => row.id);
+    const rows = [];
+    for (const agentId of agentIds) rows.push(...listRequests({ agentId }));
+    return reply.send(rows);
+  });
+
+  function myRequestContext(request, reply, user) {
+    const row = getDatabase().prepare("SELECT agent_id FROM upgrade_requests WHERE id=?").get(request.params.id);
+    if (!row) {
+      reply.code(404).send({ error: "request not found" });
+      return null;
+    }
+    const ctx = membershipForAgent(row.agent_id, user.id);
+    if (!ctx) {
+      reply.code(404).send({ error: "request not found" });
+      return null;
+    }
+    return ctx;
+  }
+
+  app.get("/v1/my/requests/:id", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user) return;
+    if (!myRequestContext(request, reply, user)) return;
+    try {
+      return reply.send(getRequest(request.params.id));
+    } catch (error) {
+      return reply.code(error.statusCode ?? 500).send({ error: safeText(error.message ?? "error") });
+    }
+  });
+
+  app.post("/v1/my/requests/:id/approve", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myRequestContext(request, reply, user);
+    if (!ctx) return;
+    if (!canApprove(ctx.membership.role)) return reply.code(403).send({ error: "approver role required" });
+    const parsed = approveSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    try {
+      return reply.send(await approveRequest({ requestId: request.params.id, note: parsed.data.note, extraBudgetSui: parsed.data.extra_budget_sui, decidedBy: `user:${user.id}` }));
+    } catch (error) {
+      return reply.code(error.statusCode ?? 500).send({ error: safeText(error.message ?? "error") });
+    }
+  });
+
+  app.post("/v1/my/requests/:id/reject", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const ctx = myRequestContext(request, reply, user);
+    if (!ctx) return;
+    if (!canApprove(ctx.membership.role)) return reply.code(403).send({ error: "approver role required" });
+    const parsed = rejectSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    try {
+      return reply.send(await rejectRequest({ requestId: request.params.id, note: parsed.data.note, decidedBy: `user:${user.id}` }));
+    } catch (error) {
+      return reply.code(error.statusCode ?? 500).send({ error: safeText(error.message ?? "error") });
+    }
+  });
+
+  app.post("/v1/my/payroll/run", async (request, reply) => {
+    const user = authenticateMy(request, reply);
+    if (!user || !csrfGuard(request, reply) || !(rateAllowed("my-mutate", clientIp(request), 60))) return;
+    const workspace = workspaceForUser(user);
+    if (!workspace) return reply.code(404).send({ error: "no workspace" });
+    if (memberRoleFor(workspace.id, user.id) !== "owner") return reply.code(403).send({ error: "owner role required" });
+    const parsed = myPayrollSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
+    const requestedIds = parsed.data.agent_ids?.length ? [...new Set(parsed.data.agent_ids)] : null;
+    if (requestedIds) {
+      // requested agents must live in this workspace; anything else answers 404
+      const placeholders = requestedIds.map(() => "?").join(",");
+      const found = new Set(getDatabase().prepare(`SELECT id FROM agents WHERE id IN (${placeholders}) AND workspace_id=?`).all(...requestedIds, workspace.id).map((row) => row.id));
+      const missingId = requestedIds.find((id) => !found.has(id));
+      if (missingId) return reply.code(404).send({ error: "agent not found", agent_id: missingId });
+    }
+    const out = await payrollRun({ periodLabel: parsed.data.period_label, agentIds: requestedIds ?? null, workspaceId: workspace.id });
+    return reply.code(out.status).send(out.body);
+  });
+
+  const myAgentReads = [
+    { key: "events", handler: (agentId, request) => {
+      const parsed = eventQuerySchema.safeParse(request.query);
+      if (!parsed.success) return { code: 400, body: { error: "invalid query", issues: parsed.error.issues } };
+      const { limit, type } = parsed.data;
+      const rows = type
+        ? getDatabase().prepare("SELECT * FROM events WHERE agent_id=? AND type=? ORDER BY ts DESC LIMIT ?").all(agentId, type, limit)
+        : getDatabase().prepare("SELECT * FROM events WHERE agent_id=? ORDER BY ts DESC LIMIT ?").all(agentId, limit);
+      return parseEventRows(rows);
+    } },
+    { key: "reviews", handler: (agentId) => getDatabase().prepare(`
+      SELECT r.*,
+        (SELECT COUNT(*) FROM gaps g WHERE g.review_id=r.id) AS gap_count,
+        (SELECT COUNT(*) FROM gaps g WHERE g.review_id=r.id AND g.status='passed_gate') AS passed_gap_count
+      FROM reviews r WHERE r.agent_id=? ORDER BY r.created_at DESC, r.rowid DESC
+    `).all(agentId).map(publicReview) },
+    { key: "scores", handler: (agentId) => getDatabase().prepare("SELECT * FROM agent_scores WHERE agent_id=? ORDER BY created_at DESC,rowid DESC").all(agentId).map(publicScore) },
+    { key: "transactions", handler: (agentId) => getDatabase().prepare("SELECT * FROM transactions WHERE agent_id=? ORDER BY created_at DESC").all(agentId).map(publicTransaction) },
+    { key: "verdicts", handler: (agentId) => listVerdicts(agentId) },
+    { key: "lessons", handler: (agentId) => lessonsForAgent(agentId).map((lesson) => ({ kind: lesson.kind, capability_key: lesson.capability_key, task_category: lesson.task_category, verdict: lesson.verdict, detail: lesson.detail, blob_id: lesson.blob_id, recalled_at: lesson.recalled_at })) },
+    { key: "guidance", handler: (agentId) => guidanceForAgent(agentId) },
+  ];
+  for (const read of myAgentReads) {
+    app.get(`/v1/my/agents/:id/${read.key}`, async (request, reply) => {
+      const user = authenticateMy(request, reply);
+      if (!user) return;
+      const ctx = myAgentContext(request, reply, user);
+      if (!ctx) return;
+      const result = await read.handler(ctx.agent.id, request);
+      if (result && typeof result === "object" && "code" in result && "body" in result && typeof result.code === "number") {
+        return reply.code(result.code).send(result.body);
+      }
+      return reply.send(result);
+    });
+  }
 
   app.post("/v1/agents/register", async (request, reply) => {
     const token = bearerToken(request);
@@ -262,8 +906,9 @@ export async function buildServer() {
   });
 
   app.post("/v1/events", async (request, reply) => {
-    const agent = agentForToken(bearerToken(request));
+    const agent = agentForKeyIncludingPaused(bearerToken(request));
     if (!agent) return authError(reply);
+    if (!pausedAgentGuard(agent, reply)) return;
     const parsed = eventSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
 
@@ -513,85 +1158,21 @@ export async function buildServer() {
     if (!isAdminToken(bearerToken(request))) return authError(reply);
     const parsed = payrollSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
-    const db = getDatabase();
     const requestedIds = [...new Set([...(parsed.data.agent_id ? [parsed.data.agent_id] : []), ...(parsed.data.agent_ids ?? [])])];
     if (requestedIds.length) {
       const placeholders = requestedIds.map(() => "?").join(",");
-      const foundIds = new Set(db.prepare(`SELECT id FROM agents WHERE id IN (${placeholders})`).all(...requestedIds).map((row) => row.id));
+      const foundIds = new Set(getDatabase().prepare(`SELECT id FROM agents WHERE id IN (${placeholders})`).all(...requestedIds).map((row) => row.id));
       const missingId = requestedIds.find((id) => !foundIds.has(id));
       if (missingId) return reply.code(404).send({ error: "agent not found", agent_id: missingId });
     }
-    const agents = requestedIds.length
-      ? (() => {
-        const placeholders = requestedIds.map(() => "?").join(",");
-        return db.prepare(`SELECT id,name FROM agents WHERE id IN (${placeholders}) AND status='active' ORDER BY created_at`).all(...requestedIds);
-      })()
-      : db.prepare("SELECT id,name FROM agents WHERE status='active' ORDER BY created_at").all();
-    const eligible = agents.map((agent) => ({
-      agent,
-      wallet: getWallet("agent", agent.id),
-      policy: db.prepare("SELECT * FROM policies WHERE agent_id=?").get(agent.id),
-    })).filter((item) => item.wallet && item.policy);
-    if (agents.length && !eligible.length) return reply.code(409).send({ error: "no active agents have both a wallet and payroll policy" });
-    const treasury = getWallet("treasury", "treasury");
-    if (!treasury) return reply.code(409).send({ error: "treasury wallet has not been created" });
-    if (!eligible.length) return { period_label: parsed.data.period_label, paid: [], skipped: agents.length };
-
-    const salariesRequired = eligible.reduce((sum, item) => sum + BigInt(item.policy.salary_mist), 0n);
-    const estimatedGas = BigInt(eligible.length) * 50_000_000n;
-    const required = salariesRequired + estimatedGas;
-    const treasuryBalance = await getPayrollBalance(treasury.address);
-    if (treasuryBalance < required) {
-      return reply.code(402).send({
-        error: "insufficient treasury balance for payroll and transaction gas",
-        treasury_address: treasury.address,
-        balance_sui: formatMist(treasuryBalance),
-        required_sui: formatMist(required),
-        agent_ids: eligible.map(({ agent }) => agent.id),
-        total_required_sui: formatMist(required),
-        estimated_gas_sui: formatMist(estimatedGas),
-        treasury_balance_sui: formatMist(treasuryBalance),
-      });
-    }
-
-    const paid = [];
-    for (const item of eligible) {
-      const amount = BigInt(item.policy.salary_mist);
-      const txId = `pay_${randomUUID()}`;
-      try {
-        const confirmation = await transferSui(treasury, item.wallet.address, amount, {
-          onExecuted: (execution) => db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,checkpoint,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), execution.error ?? "execution_submitted", execution.status, execution.digest, execution.confirmedAt, execution.checkpoint, new Date().toISOString()),
-        });
-        const createdAt = new Date().toISOString();
-        const start = periodStart(item.agent.id);
-        const spent = spentSince(item.agent.id, start);
-        const saved = amount - spent;
-        const payslipId = `slip_${randomUUID()}`;
-        const transaction = db.transaction(() => {
-          db.prepare(`UPDATE transactions SET rule_result=?,status=?,digest=?,confirmed_at=?,checkpoint=? WHERE id=?`)
-            .run(confirmation.error ?? "salary_paid", confirmation.status === "success" ? "executed" : confirmation.status, confirmation.digest, confirmation.confirmedAt, confirmation.checkpoint, txId);
-          db.prepare(`INSERT INTO payslips(id,agent_id,period_label,salary_mist,spent_mist,saved_mist,salary_digest,created_at)
-            VALUES(?,?,?,?,?,?,?,?)`).run(payslipId, item.agent.id, parsed.data.period_label, amount.toString(), spent.toString(), saved.toString(), confirmation.digest, createdAt);
-        });
-        transaction();
-        paid.push({ agent_id: item.agent.id, salary_sui: formatMist(amount), digest: confirmation.digest, status: confirmation.status, payslip_id: payslipId });
-      } catch (error) {
-          const failure = reportTransferFailure(error);
-        const existing = db.prepare("SELECT id FROM transactions WHERE id=?").get(txId);
-        if (existing) db.prepare("UPDATE transactions SET rule_result=?,status='failed',digest=COALESCE(?,digest),confirmed_at=?,checkpoint=? WHERE id=?")
-          .run(`${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, error.checkpoint ?? null, txId);
-        else db.prepare(`INSERT INTO transactions(id,agent_id,kind,to_address,amount_mist,rule_result,status,digest,confirmed_at,created_at)
-            VALUES(?,?,?,?,?,?, 'failed',?,?,?)`).run(txId, item.agent.id, "salary", item.wallet.address, amount.toString(), `${failure.stage}: ${failure.message}`, error.digest ?? null, error.confirmedAt ?? null, new Date().toISOString());
-          return reply.code(502).send({ error: "payroll transfer failed", stage: failure.stage, message: failure.message, paid, failed_agent_id: item.agent.id });
-      }
-    }
-    return { period_label: parsed.data.period_label, paid, skipped: agents.length - eligible.length };
+    const out = await payrollRun({ periodLabel: parsed.data.period_label, agentIds: requestedIds.length ? requestedIds : null });
+    return reply.code(out.status).send(out.body);
   });
 
   app.post("/v1/spend", async (request, reply) => {
-    const agent = agentForToken(bearerToken(request));
+    const agent = agentForKeyIncludingPaused(bearerToken(request));
     if (!agent) return authError(reply);
+    if (!pausedAgentGuard(agent, reply)) return;
     const parsed = spendSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid request", issues: parsed.error.issues });
     let amount;

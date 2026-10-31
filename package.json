@@ -8,6 +8,7 @@
   },
   "scripts": {
     "smoke": "node scripts/smoke.js",
+    "smoke:auth": "node scripts/smoke-auth.js",
     "dev": "node src/server.js",
     "dashboard:install": "npm --prefix dashboard install",
     "dashboard:build": "npm --prefix dashboard run build",

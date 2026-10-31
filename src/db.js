@@ -356,6 +356,61 @@ export function initDatabase() {
   const agentColumns=database.prepare("PRAGMA table_info(agents)").all().map(column=>column.name);
   if(!agentColumns.includes("public"))database.exec("ALTER TABLE agents ADD COLUMN public INTEGER NOT NULL DEFAULT 0 CHECK(public IN (0,1))");
   if(!agentColumns.includes("demo_actionable"))database.exec("ALTER TABLE agents ADD COLUMN demo_actionable INTEGER NOT NULL DEFAULT 0 CHECK(demo_actionable IN (0,1))");
+
+  /* Phase B1: accounts, sessions, workspaces (idempotent, safe on existing DBs) */
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE,
+      password_hash TEXT,
+      name TEXT NOT NULL,
+      wallet_address TEXT UNIQUE,
+      wallet_verified_at TEXT,
+      role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user','guest','admin')),
+      created_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS users_email ON users(email);
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      ip_hash TEXT,
+      user_agent_hash TEXT
+    );
+    CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id, expires_at);
+    CREATE TABLE IF NOT EXISTS auth_nonces (
+      nonce TEXT PRIMARY KEY,
+      purpose TEXT NOT NULL CHECK(purpose IN ('login','link')),
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      owner_user_id TEXT REFERENCES users(id),
+      treasury_wallet_ref TEXT,
+      network TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived'))
+    );
+    CREATE TABLE IF NOT EXISTS workspace_members (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+      user_id TEXT NOT NULL REFERENCES users(id),
+      role TEXT NOT NULL CHECK(role IN ('owner','approver','viewer')),
+      PRIMARY KEY(workspace_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS workspace_members_user ON workspace_members(user_id);
+  `);
+  if(!agentColumns.includes("workspace_id"))database.exec("ALTER TABLE agents ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default'");
+  if(!agentColumns.includes("owner_user_id"))database.exec("ALTER TABLE agents ADD COLUMN owner_user_id TEXT");
+  if(!agentColumns.includes("custody"))database.exec("ALTER TABLE agents ADD COLUMN custody TEXT NOT NULL DEFAULT 'server'");
+  if(!agentColumns.includes("payout_address"))database.exec("ALTER TABLE agents ADD COLUMN payout_address TEXT");
+  database.exec("CREATE INDEX IF NOT EXISTS agents_workspace ON agents(workspace_id)");
+  const boot = new Date().toISOString();
+  database.prepare("INSERT OR IGNORE INTO users(id,name,role,created_at) VALUES(?,'System','admin',?)").run("usr_system", boot);
+  database.prepare("INSERT OR IGNORE INTO workspaces(id,name,owner_user_id,treasury_wallet_ref,network,created_at,status) VALUES('ws_default','Default workspace','usr_system','treasury',?,?,'active')").run(getConfig().SUI_NETWORK, boot);
+  database.prepare("INSERT OR IGNORE INTO workspace_members(workspace_id,user_id,role) VALUES('ws_default','usr_system','admin')").run();
   return database;
 }
 

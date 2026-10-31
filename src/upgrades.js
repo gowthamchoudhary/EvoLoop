@@ -17,6 +17,7 @@ import { PREMIUM_CAPABILITY_KEY } from "./premium-config.js";
 import { passStatus, verifyReceipt } from "./premium.js";
 import { settingsFor } from "./settings.js";
 import { spendForAgent, withAgentSpendLock } from "./spend.js";
+import { treasuryWalletForAgent } from "./auth.js";
 import { verdictBlocking } from "./verdicts.js";
 import { getWallet } from "./wallets.js";
 
@@ -476,7 +477,7 @@ export async function executeRequest({ requestId }) {
     const balance = await getPayrollBalance(agentWallet.address, { bypassCache: true });
     if (balance < cost + reserve) {
       const shortfall = cost + reserve - balance;
-      const treasury = getWallet("treasury", "treasury");
+      const treasury = treasuryWalletForAgent(request.agent_id);
       if (!treasury) return finish("topup", "treasury wallet is missing");
       const txId = `topup_${randomUUID()}`;
       const createdAt = new Date().toISOString();
